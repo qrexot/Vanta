@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vanta</string>
+    <string name="notification_channel_recording">ჩაწერა და ტრანსკრიბაცია</string>
+    <string name="notification_channel_recording_desc">აქტიური ჩაწერისა და ლოკალური მეტყველების ამოცნობის შეტყობინება</string>
+    <string name="notification_recording_active">ჩაწერა და ამოცნობა</string>
+    <string name="notification_recording_paused">ჩაწერა დაპაუზებულია</string>
+    <string name="action_pause">პაუზა</string>
+    <string name="action_resume">გაგრძელება</string>
+    <string name="action_bookmark">ნიშნული</string>
+    <string name="action_stop">დასრულება</string>
+</resources>

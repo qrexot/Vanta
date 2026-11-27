@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vanta</string>
+    <string name="notification_channel_recording">録音と文字起こし</string>
+    <string name="notification_channel_recording_desc">録音およびローカル音声認識の通知</string>
+    <string name="notification_recording_active">録音と文字起こし中</string>
+    <string name="notification_recording_paused">録音一時停止中</string>
+    <string name="action_pause">一時停止</string>
+    <string name="action_resume">再開</string>
+    <string name="action_bookmark">しおり</string>
+    <string name="action_stop">終了</string>
+</resources>

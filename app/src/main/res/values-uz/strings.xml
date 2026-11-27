@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vanta</string>
+    <string name="notification_channel_recording">Yozish va transkripsiya</string>
+    <string name="notification_channel_recording_desc">Faol yozuv va mahalliy nutqni tanish bildirishnomasi</string>
+    <string name="notification_recording_active">Yozish va tanish</string>
+    <string name="notification_recording_paused">Yozuv pauzada</string>
+    <string name="action_pause">Pauza</string>
+    <string name="action_resume">Davom ettirish</string>
+    <string name="action_bookmark">Belgi</string>
+    <string name="action_stop">Tugatish</string>
+</resources>

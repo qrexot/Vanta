@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vanta</string>
+    <string name="notification_channel_recording">ৰেকৰ্ডিং আৰু লিখনি</string>
+    <string name="notification_channel_recording_desc">সক্ৰিয় ৰেকৰ্ডিং আৰু স্থানীয় কথা চিনাক্তকৰণ জাননী</string>
+    <string name="notification_recording_active">ৰেকৰ্ডিং আৰু চিনাক্তকৰণ চলি আছে</string>
+    <string name="notification_recording_paused">ৰেকৰ্ডিং বিৰতিত</string>
+    <string name="action_pause">বিৰতি</string>
+    <string name="action_resume">চলাই থাকক</string>
+    <string name="action_bookmark">চিহ্ন</string>
+    <string name="action_stop">সমাপ্ত</string>
+</resources>

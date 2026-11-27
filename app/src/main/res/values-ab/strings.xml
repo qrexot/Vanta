@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vanta</string>
+    <string name="notification_channel_recording">Анҵареи атранскрибациеи</string>
+    <string name="notification_channel_recording_desc">Анҵара амҩаԥысреи ацәажәара аилкаареи рыдырраҭара</string>
+    <string name="notification_recording_active">Анҵареи аилкаареи</string>
+    <string name="notification_recording_paused">Анҵара аанкылоуп</string>
+    <string name="action_pause">Аанкылара</string>
+    <string name="action_resume">Аиҭалагара</string>
+    <string name="action_bookmark">Адырга</string>
+    <string name="action_stop">Ахырқәшара</string>
+</resources>

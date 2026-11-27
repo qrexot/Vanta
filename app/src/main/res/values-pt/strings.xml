@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vanta</string>
+    <string name="notification_channel_recording">Gravação e transcrição</string>
+    <string name="notification_channel_recording_desc">Notificação de gravação e reconhecimento local</string>
+    <string name="notification_recording_active">Gravando e transcrevendo</string>
+    <string name="notification_recording_paused">Gravação pausada</string>
+    <string name="action_pause">Pausar</string>
+    <string name="action_resume">Retomar</string>
+    <string name="action_bookmark">Marcador</string>
+    <string name="action_stop">Finalizar</string>
+</resources>

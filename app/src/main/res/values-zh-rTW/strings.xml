@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vanta</string>
+    <string name="notification_channel_recording">錄音與轉寫</string>
+    <string name="notification_channel_recording_desc">持續錄音與本機語音辨識通知</string>
+    <string name="notification_recording_active">正在錄音與轉寫</string>
+    <string name="notification_recording_paused">錄音已暫停</string>
+    <string name="action_pause">暫停</string>
+    <string name="action_resume">繼續</string>
+    <string name="action_bookmark">標記</string>
+    <string name="action_stop">結束</string>
+</resources>

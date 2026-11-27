@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vanta</string>
+    <string name="notification_channel_recording">הקלטה ותמלול</string>
+    <string name="notification_channel_recording_desc">התראה על הקלטה פעילה וזיהוי דיבור מקומי</string>
+    <string name="notification_recording_active">מקליט ומתמלל</string>
+    <string name="notification_recording_paused">הקלטה מושהית</string>
+    <string name="action_pause">השהיה</string>
+    <string name="action_resume">המשך</string>
+    <string name="action_bookmark">סימנייה</string>
+    <string name="action_stop">סיום</string>
+</resources>

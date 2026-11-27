@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vanta</string>
+    <string name="notification_channel_recording">Nagrywanie i transkrypcja</string>
+    <string name="notification_channel_recording_desc">Powiadomienie o aktywnym nagrywaniu i rozpoznawaniu</string>
+    <string name="notification_recording_active">Nagrywanie i rozpoznawanie</string>
+    <string name="notification_recording_paused">Nagrywanie wstrzymane</string>
+    <string name="action_pause">Pauza</string>
+    <string name="action_resume">Wznów</string>
+    <string name="action_bookmark">Znacznik</string>
+    <string name="action_stop">Zakończ</string>
+</resources>

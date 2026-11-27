@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vanta</string>
+    <string name="notification_channel_recording">التسجيل والتفريغ</string>
+    <string name="notification_channel_recording_desc">إشعار التسجيل النشط والتعرف المحلي على الكلام</string>
+    <string name="notification_recording_active">جارٍ التسجيل والتفريغ</string>
+    <string name="notification_recording_paused">التسجيل متوقف مؤقتاً</string>
+    <string name="action_pause">إيقاف مؤقت</string>
+    <string name="action_resume">استئناف</string>
+    <string name="action_bookmark">علامة</string>
+    <string name="action_stop">إنهاء</string>
+</resources>
