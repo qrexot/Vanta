@@ -162,3 +162,53 @@ class ParagraphAccumulator(
         pendingBookmarkLabel = null
     }
 }
+
+object AsrWindowMerger {
+    private fun normalizeToken(text: String): String =
+        text.lowercase().trim { !it.isLetterOrDigit() }
+
+    /**
+     * Filters out sliding-window boundary duplicates when slightly shifted timestamps cause a trailing
+     * committed word sequence to reappear past [coveredUntilSec].
+     */
+    fun trimOverlapWords(
+        words: List<TranscriptWord>,
+        coveredUntilSec: Float,
+        recentEmittedWords: List<TranscriptWord>
+    ): List<TranscriptWord> {
+        if (words.isEmpty()) return emptyList()
+        var idx = 0
+        while (idx < words.size) {
+            val w = words[idx]
+            val mid = (w.start + w.end) * 0.5f
+            if (mid < coveredUntilSec - 0.03f) {
+                idx++
+            } else {
+                break
+            }
+        }
+        val tail = recentEmittedWords.takeLast(4)
+        if (idx < words.size && tail.isNotEmpty()) {
+            val remaining = words.size - idx
+            val maxK = minOf(tail.size, remaining)
+            var matched = 0
+            for (k in maxK downTo 1) {
+                val tailSlice = tail.subList(tail.size - k, tail.size)
+                val newSlice = words.subList(idx, idx + k)
+                val allMatch = tailSlice.zip(newSlice).all { (oldW, newW) ->
+                    val oldKey = normalizeToken(oldW.text)
+                    val newKey = normalizeToken(newW.text)
+                    val oldMid = (oldW.start + oldW.end) * 0.5f
+                    val newMid = (newW.start + newW.end) * 0.5f
+                    oldKey.isNotEmpty() && oldKey == newKey && kotlin.math.abs(newMid - oldMid) <= 0.65f
+                }
+                if (allMatch) {
+                    matched = k
+                    break
+                }
+            }
+            idx += matched
+        }
+        return if (idx <= 0) words else if (idx >= words.size) emptyList() else words.subList(idx, words.size)
+    }
+}

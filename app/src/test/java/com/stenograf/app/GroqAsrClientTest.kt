@@ -115,6 +115,63 @@ class GroqAsrClientTest {
         assertTrue(multiBody.contains("name=\"prompt\""))
     }
 
+    @Test
+    fun filtersWhisperHallucinationsAndPreservesLastWordAtExactChunkEnd() {
+        val parsed = GroqAsrClient.parseTranscript(
+            """
+            {
+              "language": "ru",
+              "segments": [
+                {"start": 0.0, "end": 2.0, "text": "Субтитры сделал DimaTorzok", "no_speech_prob": 0.94, "avg_logprob": -0.92},
+                {"start": 2.0, "end": 4.0, "text": "да да да да да да", "compression_ratio": 3.4},
+                {"start": 4.0, "end": 4.5, "text": "...", "no_speech_prob": 0.1},
+                {"start": 5.0, "end": 12.0, "text": "Привет конец", "no_speech_prob": 0.08, "avg_logprob": -0.21}
+              ],
+              "words": [
+                {"start": 5.2, "end": 5.8, "word": "Привет"},
+                {"start": 12.0, "end": 12.0, "word": "конец"}
+              ]
+            }
+            """.trimIndent(),
+            duration = 12f
+        )
+
+        val seg = parsed.segments.single()
+        assertEquals("Привет конец", seg.text)
+        assertEquals(listOf("Привет", "конец"), seg.words.map { it.text })
+    }
+
+    @Test
+    fun skipsSilentElectricalHumAndClicksWhileAcceptingQuietSpeech() {
+        val silence = ByteArray(16_000)
+        assertFalse(GroqAsrClient.hasSignal(silence))
+
+        // Single impulse click must not trigger a Whisper request
+        val singleClick = ByteArray(16_000)
+        singleClick[500] = 0x00
+        singleClick[501] = 0x20
+        assertFalse(GroqAsrClient.hasSignal(singleClick))
+
+        // Steady faint -60 dBFS hum (amplitude ~30) should also stay gated
+        val hum = ByteArray(16_000)
+        for (i in 0 until hum.size step 2) {
+            val v: Short = if ((i / 2) % 2 == 0) 30 else -30
+            hum[i] = (v.toInt() and 0xFF).toByte()
+            hum[i + 1] = ((v.toInt() shr 8) and 0xFF).toByte()
+        }
+        assertFalse(GroqAsrClient.hasSignal(hum))
+
+        // Quiet distant speech (~ -46 dBFS, peak 220) must pass
+        val softSpeech = ByteArray(16_000)
+        for (i in 0 until softSpeech.size step 2) {
+            val phase = (i / 2) % 32
+            val v = (kotlin.math.sin(phase * 2.0 * Math.PI / 32.0) * 220.0).toInt().toShort()
+            softSpeech[i] = (v.toInt() and 0xFF).toByte()
+            softSpeech[i + 1] = ((v.toInt() shr 8) and 0xFF).toByte()
+        }
+        assertTrue(GroqAsrClient.hasSignal(softSpeech))
+    }
+
     private suspend fun getFailure(server: MockWebServer, path: String): IOException {
         try {
             GroqAsrClient.execute(request(server, path))

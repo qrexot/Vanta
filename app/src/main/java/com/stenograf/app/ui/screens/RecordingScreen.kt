@@ -6,11 +6,6 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -49,7 +44,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.InlineTextContent
 import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -57,7 +51,6 @@ import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.Bookmark
 import androidx.compose.material.icons.rounded.BookmarkAdd
-import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.FormatSize
 import androidx.compose.material.icons.rounded.Fullscreen
@@ -75,6 +68,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -86,19 +80,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.Placeholder
-import androidx.compose.ui.text.PlaceholderVerticalAlign
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.em
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -118,15 +108,10 @@ import com.stenograf.app.ui.components.vantaGlass
 import com.stenograf.app.ui.components.AnimatedRecordingDot
 import com.stenograf.app.ui.components.rememberLiveTextReveal
 import com.stenograf.app.ui.components.LiveWaveformView
-import com.stenograf.app.ui.components.SheetOptionRow
+import com.stenograf.app.ui.components.SpeakerPill
 import com.stenograf.app.ui.components.StatusPill
-import com.stenograf.app.ui.components.TranscriptReviewSheet
-import com.stenograf.app.ui.components.VantaBottomSheet
-import com.stenograf.app.ui.components.VantaPrimaryButton
-import com.stenograf.app.ui.components.VantaDialog
 import com.stenograf.app.ui.components.VantaIconButton
 import com.stenograf.app.ui.components.VantaLinearProgressTrack
-import com.stenograf.app.ui.components.VantaTextField
 import com.stenograf.app.ui.components.VantaTonalButton
 import com.stenograf.app.ui.theme.LocalStenografColors
 import com.stenograf.app.ui.theme.Motion
@@ -176,7 +161,8 @@ internal fun RecordingScreen(
     var fullScreen by rememberSaveable { mutableStateOf(false) }
     var teleprompterHudVisible by remember { mutableStateOf(true) }
     var autoFollow by remember { mutableStateOf(true) }
-    val russian = AppLocaleManager.currentLanguage.value.code == "ru"
+    val activeLang by AppLocaleManager.currentLanguage.collectAsState()
+    val russian = activeLang.code == "ru"
     var reviewBlock by remember { mutableStateOf<ParagraphEntity?>(null) }
     var confirmLiveAi by remember { mutableStateOf(false) }
     var liveAiModel by rememberSaveable { mutableStateOf(TranscriptReviewModel.Fast) }
@@ -338,7 +324,7 @@ internal fun RecordingScreen(
                                             if (state.isGroqEngine) colors.accent.copy(alpha = 0.35f) else colors.border,
                                             RoundedCornerShape(Radius.pill)
                                         )
-                                        .clickable(enabled = !state.isGroqEngine) {
+                                        .clickable(enabled = !state.isGroqEngine && !state.isFinishing) {
                                             haptics.tick()
                                             showLangSheet = true
                                         }
@@ -353,10 +339,10 @@ internal fun RecordingScreen(
                                     )
                                     Spacer(Modifier.width(Spacing.xs))
                                     Text(
-                                        text = if (state.isGroqEngine) {
-                                            "Groq · ${state.groqModelId}"
-                                        } else {
-                                            "TinyASR · ${state.activeLanguage.uppercase()}"
+                                        text = when {
+                                            state.isGroqEngine -> "Groq · ${state.groqModelId}"
+                                            state.modelId == TinyAsrCatalog.GIGAAM_V4 -> "GigaAM v4 · ${state.activeLanguage.uppercase()}"
+                                            else -> "TinyASR · ${state.activeLanguage.uppercase()}"
                                         },
                                         color = if (state.isGroqEngine) colors.accent else colors.textPrimary,
                                         style = VantaType.bodySmall.copy(fontWeight = FontWeight.Medium),
@@ -680,7 +666,7 @@ internal fun RecordingScreen(
                             }
                             val backlog = AsrTextFormatter.formatDurationMs((state.backlogSeconds * 1000).toLong())
                             val statusText = when {
-                                state.isFinishing -> s.finishingTranscript
+                                state.isFinishing -> s.notifSaving
                                 state.isGroqRetrying -> "${s.groqRetryStatus} · $backlog"
                                 queueWarning -> "${s.groqCatchUpStatus} · $backlog"
                                 else -> state.asrStatusText.ifBlank { s.preparingModel }
@@ -698,7 +684,7 @@ internal fun RecordingScreen(
                                         }
                                     )
                                     .border(0.75.dp, colors.border, RoundedCornerShape(Radius.pill))
-                                    .clickable {
+                                    .clickable(enabled = !state.isGroqEngine && !state.isFinishing) {
                                         haptics.tick()
                                         showLangSheet = true
                                     }
@@ -774,7 +760,7 @@ internal fun RecordingScreen(
                                     AnimatedRecordingDot(isPaused = state.isPaused)
                                     Text(
                                         text = when {
-                                            state.isFinishing -> s.finishingTranscript
+                                            state.isFinishing -> s.notifSaving
                                             state.isPaused -> s.recordingPaused
                                             else -> s.activeRecordingBanner
                                         },
@@ -1021,30 +1007,7 @@ internal fun RecordingScreen(
                                     horizontalArrangement = Arrangement.spacedBy(Spacing.xs)
                                 ) {
                                     if (speakerLabel != null) {
-                                        val speakerColor = remember(para.speaker) {
-                                            val palette = listOf(
-                                                Color(0xFF3390EC),
-                                                Color(0xFF2EAD5B),
-                                                Color(0xFF8E63E6),
-                                                Color(0xFFEF6C00),
-                                                Color(0xFF0097A7),
-                                                Color(0xFFE91E63)
-                                            )
-                                            val idx = (para.speaker.hashCode() and 0x7FFFFFFF) % palette.size
-                                            if (para.speaker == null) colors.textMuted else palette[idx]
-                                        }
-                                        Box(
-                                            modifier = Modifier
-                                                .clip(RoundedCornerShape(Radius.pill))
-                                                .background(speakerColor.copy(alpha = if (colors.isDark) 0.22f else 0.14f))
-                                                .padding(horizontal = 8.dp, vertical = 2.dp)
-                                        ) {
-                                            Text(
-                                                text = speakerLabel,
-                                                color = speakerColor,
-                                                style = VantaType.monoBadge
-                                            )
-                                        }
+                                        SpeakerPill(speakerKey = para.speaker, label = speakerLabel)
                                     }
                                     if (showTimestamps) {
                                         Text(
@@ -1107,163 +1070,34 @@ internal fun RecordingScreen(
 
         }
 
-        if (confirmLiveAi) {
-            VantaBottomSheet(
-                onDismissRequest = { confirmLiveAi = false },
-                title = if (russian) "Автопроверка с ИИ" else "Automatic AI review",
-                subtitle = if (russian) {
-                    "Аудио готовых блоков отправляется в Groq. Whisper распознаёт его заново, GPT-OSS проверяет текст."
-                } else {
-                    "Completed audio blocks go to Groq. Whisper recognizes the audio again and GPT-OSS reviews the text."
-                },
-                headerIcon = Icons.Rounded.AutoFixHigh
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
-                    for (model in TranscriptReviewModel.entries) {
-                        SheetOptionRow(
-                            selected = model == liveAiModel,
-                            title = model.title,
-                            subtitle = when (model) {
-                                TranscriptReviewModel.Fast -> if (russian) "Быстрая обработка" else "Fast processing"
-                                TranscriptReviewModel.Detailed -> if (russian) "Сложная речь и термины" else "Difficult speech and terminology"
-                            },
-                            onClick = { liveAiModel = model }
-                        )
-                    }
-                    Text(
-                        if (russian) "Блоки, требующие проверки, можно открыть и распознать вручную."
-                        else "Open any completed block that needs a manual review.",
-                        color = colors.textSecondary,
-                        style = VantaType.bodySmall
-                    )
-                    VantaPrimaryButton(
-                        label = if (russian) "Включить для этой записи" else "Enable for this recording",
-                        modifier = Modifier.fillMaxWidth(),
-                        onClick = {
-                            confirmLiveAi = false
-                            onSetLiveAiEnabled(true, liveAiModel)
-                        }
-                    )
-                }
-            }
-        }
-
-        reviewBlock?.let { paragraph ->
-            val index = state.committedParagraphs.indexOfFirst { it.id == paragraph.id }
-            TranscriptReviewSheet(
-                originalText = paragraph.text,
-                preferredModelId = reviewModelId,
-                hasCloudKey = hasCloudKey,
-                russian = russian,
-                russianAudioByDefault = false,
-                onSelectModel = onSelectReviewModel,
-                onOpenSettings = { reviewBlock = null; onOpenGroqSettings() },
-                onRecognize = { model, forceRussian, groqOverride, hint, progress ->
-                    val before = state.committedParagraphs.getOrNull(index - 1)?.text.orEmpty()
-                    val after = state.committedParagraphs.getOrNull(index + 1)?.text.orEmpty()
-                    onRecognizeBlock(paragraph, model, forceRussian, groqOverride, before, after, hint, progress)
-                },
-                onApply = { onApplyBlock(paragraph, it.proposal.correctedText, it.recognizedWords) },
-                onCopied = { haptics.tick() },
-                onApplied = { haptics.confirm() },
-                onDismiss = { reviewBlock = null }
-            )
-        }
-
-        // Live Language preset picker sheet
-        if (showLangSheet) {
-            VantaBottomSheet(
-                onDismissRequest = { showLangSheet = false },
-                title = s.reTranscribeModelLang,
-                headerIcon = Icons.Rounded.Translate
-            ) {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 460.dp)
-                ) {
-                    items(TinyAsrCatalog.PRESETS, key = { it.id }) { preset ->
-                        val installed = modelManager.isModelInstalled(preset.modelId) ||
-                            TinyAsrCatalog.findModel(preset.modelId).bundledInApk
-                        SheetOptionRow(
-                            selected = preset.id == state.languagePresetId,
-                            title = preset.label(s),
-                            subtitle = if (installed) preset.modelId else "${preset.modelId} · ${s.modelAvailableLabel}",
-                            onClick = {
-                                haptics.tick()
-                                showLangSheet = false
-                                if (installed) {
-                                    onSwitchLanguagePreset(preset.id)
-                                } else {
-                                    missingModelIdPrompt = preset.modelId
-                                }
-                            }
-                        )
-                    }
-                }
-            }
-        }
-
-        missingModelIdPrompt?.let { missingId ->
-            val spec = TinyAsrCatalog.findModel(missingId)
-            VantaDialog(
-                onDismissRequest = { missingModelIdPrompt = null },
-                title = s.modelRequiredInstallPrompt,
-                icon = Icons.Rounded.Download,
-                highlightText = "${spec.localizedTitle(s)} (${spec.sizeMb} MB)",
-                confirmLabel = s.manageModelsTitle,
-                onConfirm = {
-                    missingModelIdPrompt = null
-                    onOpenModelManager()
-                },
-                dismissLabel = s.cancel,
-                onDismiss = { missingModelIdPrompt = null }
-            )
-        }
-
-        if (showBookmarkDialog) {
-            VantaDialog(
-                onDismissRequest = { showBookmarkDialog = false },
-                title = s.bookmarkDialogTitle,
-                icon = Icons.Rounded.BookmarkAdd,
-                iconTint = colors.warning,
-                iconContainerColor = colors.warningSoft,
-                confirmLabel = s.addButton,
-                onConfirm = {
-                    haptics.confirm()
-                    onAddBookmark(bookmarkNote.takeIf { it.isNotBlank() })
-                    showBookmarkDialog = false
-                },
-                dismissLabel = s.cancel,
-                onDismiss = { showBookmarkDialog = false }
-            ) {
-                VantaTextField(
-                    value = bookmarkNote,
-                    onValueChange = { bookmarkNote = it },
-                    label = s.bookmarkNoteLabel,
-                    singleLine = true
-                )
-            }
-        }
+        LiveRecordingModals(
+            confirmLiveAi = confirmLiveAi,
+            liveAiModel = liveAiModel,
+            onSelectLiveAiModel = { liveAiModel = it },
+            onDismissConfirmLiveAi = { confirmLiveAi = false },
+            onEnableLiveAi = { model -> onSetLiveAiEnabled(true, model) },
+            reviewBlock = reviewBlock,
+            onDismissReviewBlock = { reviewBlock = null },
+            state = state,
+            russian = russian,
+            hasCloudKey = hasCloudKey,
+            reviewModelId = reviewModelId,
+            onSelectReviewModel = onSelectReviewModel,
+            onOpenGroqSettings = onOpenGroqSettings,
+            onRecognizeBlock = onRecognizeBlock,
+            onApplyBlock = onApplyBlock,
+            showLangSheet = showLangSheet,
+            onDismissLangSheet = { showLangSheet = false },
+            modelManager = modelManager,
+            onSwitchLanguagePreset = onSwitchLanguagePreset,
+            missingModelIdPrompt = missingModelIdPrompt,
+            onMissingModelPrompt = { missingModelIdPrompt = it },
+            onOpenModelManager = onOpenModelManager,
+            showBookmarkDialog = showBookmarkDialog,
+            bookmarkNote = bookmarkNote,
+            onBookmarkNoteChange = { bookmarkNote = it },
+            onDismissBookmarkDialog = { showBookmarkDialog = false },
+            onAddBookmark = onAddBookmark
+        )
     }
 }
-
-private val liveCursorContent = mapOf(
-    "live_cursor" to InlineTextContent(Placeholder(0.4.em, 0.78.em, PlaceholderVerticalAlign.TextCenter)) {
-        val color = LocalStenografColors.current.accent
-        val transition = rememberInfiniteTransition(label = "stream_cursor")
-        val opacity by transition.animateFloat(
-            initialValue = 1f,
-            targetValue = 0.25f,
-            animationSpec = infiniteRepeatable(tween(680, easing = Motion.StandardEasing), RepeatMode.Reverse),
-            label = "cursor_opacity"
-        )
-        Box(
-            Modifier
-                .fillMaxSize()
-                .padding(start = 3.dp, end = 1.dp)
-                .graphicsLayer { alpha = opacity }
-                .background(color, RoundedCornerShape(1.dp))
-        )
-    }
-)

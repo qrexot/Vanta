@@ -8,6 +8,23 @@ import java.nio.ByteOrder
 object WavHelper {
     const val HEADER_SIZE = 44
 
+    /** Check the fixed-layout mono PCM16 header used by the recorder before bypassing the decoder. */
+    fun monoPcm16SampleRate(file: File): Int? {
+        if (!file.isFile || file.length() < HEADER_SIZE) return null
+        return runCatching {
+            val bytes = ByteArray(HEADER_SIZE)
+            RandomAccessFile(file, "r").use { it.readFully(bytes) }
+            val header = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            if (String(bytes, 0, 4, Charsets.US_ASCII) != "RIFF" ||
+                String(bytes, 8, 8, Charsets.US_ASCII) != "WAVEfmt " ||
+                String(bytes, 36, 4, Charsets.US_ASCII) != "data" ||
+                header.getInt(16) != 16 || header.getShort(20).toInt() != 1 ||
+                header.getShort(22).toInt() != 1 || header.getShort(32).toInt() != 2 ||
+                header.getShort(34).toInt() != 16
+            ) null else header.getInt(24).takeIf { it > 0 }
+        }.getOrNull()
+    }
+
     fun createHeader(sampleRate: Int, channels: Int = 1, bitsPerSample: Int = 16, dataSize: Long = 0L): ByteArray {
         val byteRate = sampleRate * channels * bitsPerSample / 8
         val blockAlign = channels * bitsPerSample / 8

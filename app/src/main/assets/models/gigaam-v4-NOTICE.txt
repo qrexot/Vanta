@@ -1,0 +1,3 @@
+GigaAM weights and code: Copyright (c) 2026 Giga, MIT.
+The upstream encoder includes code adapted from Xiaomi Corp., Daniel Povey and Zengwei Yao, Apache-2.0.
+Evaluation references: Google FLEURS, CC BY 4.0.

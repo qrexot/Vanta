@@ -15,8 +15,8 @@ android {
         applicationId = "com.stenograf.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "1.3.5"
+        versionCode = 16
+        versionName = "1.3.11"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -25,6 +25,7 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += listOf("-std=c++17", "-O3", "-Wall")
+                arguments += "-DONNX_HEADERS=${layout.buildDirectory.dir("generated/onnxruntime/headers").get().asFile.invariantSeparatorsPath}"
             }
         }
     }
@@ -80,7 +81,24 @@ android {
     }
 }
 
+// Compile against the ONNX C API. Sherpa already supplies the runtime for all APK ABIs.
+val onnxHeadersArtifact by configurations.creating {
+    isTransitive = false
+}
+val extractOnnxHeaders by tasks.registering(Sync::class) {
+    from({ zipTree(onnxHeadersArtifact.singleFile) }) {
+        include("headers/**")
+    }
+    into(layout.buildDirectory.dir("generated/onnxruntime"))
+}
+tasks.configureEach {
+    if (name.startsWith("configureCMake") || name.startsWith("buildCMake")) {
+        dependsOn(extractOnnxHeaders)
+    }
+}
+
 dependencies {
+    onnxHeadersArtifact("com.microsoft.onnxruntime:onnxruntime-android:1.28.0@aar")
     implementation(files("libs/sherpa-onnx-2.0.3.aar"))
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 

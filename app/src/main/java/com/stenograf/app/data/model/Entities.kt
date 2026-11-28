@@ -100,3 +100,25 @@ data class ParagraphEntity(
     val bookmarkLabel: String? = null,
     val speaker: String? = null
 )
+
+@Entity(
+    tableName = "speaker_profiles",
+    indices = [Index("name"), Index("updatedAtMs")]
+)
+data class SpeakerProfileEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0L,
+    val name: String,
+    val embeddingJson: String,
+    val prototypesJson: String = "[]",
+    val sampleCount: Int = 1,
+    val isAutoLearned: Boolean = false,
+    val createdAtMs: Long = System.currentTimeMillis(),
+    val updatedAtMs: Long = System.currentTimeMillis(),
+    val tagOrPhone: String = "",
+    val sampleAudioPath: String = "",
+    val sampleTranscript: String = "",
+    val sampleSourceTitle: String = "",
+    val sampleRecordingId: Long? = null,
+    val sampleStartSec: Float = 0f,
+    val speechSeconds: Float = 0f
+)

@@ -1,12 +1,4 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Vanta</string>
-    <string name="notification_channel_recording">Recording &amp; transcription</string>
-    <string name="notification_channel_recording_desc">Ongoing audio recording and local speech recognition</string>
-    <string name="notification_recording_active">Recording &amp; transcribing</string>
-    <string name="notification_recording_paused">Recording paused</string>
-    <string name="action_pause">Pause</string>
-    <string name="action_resume">Resume</string>
-    <string name="action_bookmark">Bookmark</string>
-    <string name="action_stop">Finish</string>
 </resources>

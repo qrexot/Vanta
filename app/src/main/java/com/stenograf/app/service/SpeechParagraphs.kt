@@ -64,6 +64,9 @@ internal fun continuesSpeechParagraph(left: ParagraphEntity, right: ParagraphEnt
 internal fun speakerLabel(): String =
     if (AppLocaleManager.currentLanguage.value.code == "ru") "Спикер" else "Speaker"
 
+internal fun autoVoicePrefix(): String =
+    if (AppLocaleManager.currentLanguage.value.code == "ru") "Голос" else "Voice"
+
 internal fun SpeakerAttributionSession.seedFromTranscript(
     audio: RandomAccessFile,
     pcmBase: Long,

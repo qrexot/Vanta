@@ -4,3 +4,7 @@
 -dontwarn kotlinx.serialization.**
 
 -keep class com.k2fsa.sherpa.onnx.** { *; }
+
+-keep class com.stenograf.app.audio.AudioOnnxNative { *; }
+
+-keep class com.stenograf.app.asr.GigaAmV4Native { *; }

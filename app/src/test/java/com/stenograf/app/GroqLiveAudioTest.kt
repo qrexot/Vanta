@@ -98,4 +98,25 @@ class GroqLiveAudioTest {
         assertEquals(0, committed)
         assertEquals(2L * chunkBytes, spool.length())
     }
+
+    @Test
+    fun deduplicatesBoundaryWordsAcrossDriftedOverlapAndFindsPauseInNoise() {
+        val prev = listOf(
+            com.stenograf.app.asr.TranscriptWord("привет", 9.0f, 9.4f),
+            com.stenograf.app.asr.TranscriptWord("мир", 9.45f, 9.95f)
+        )
+        val overlap = listOf(
+            com.stenograf.app.asr.TranscriptWord("привет", 0.1f, 0.5f),
+            com.stenograf.app.asr.TranscriptWord("мир", 0.55f, 1.08f), // +0.47s drift across prefix vs chunk boundary
+            com.stenograf.app.asr.TranscriptWord("тест", 1.15f, 1.6f)
+        )
+        val result = com.stenograf.app.service.ownTranscriptWords(
+            GroqAsrClient.Transcript("ru", listOf(com.stenograf.app.asr.SpeechSegment.fromWords(overlap))),
+            prefix = 0.75f,
+            duration = 2.0f,
+            precedingWords = prev,
+            offset = 10.0f
+        )
+        assertEquals("тест", result.segments.single().text)
+    }
 }

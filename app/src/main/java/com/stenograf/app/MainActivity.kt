@@ -31,8 +31,6 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -41,14 +39,11 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.Layers
 import androidx.compose.material.icons.rounded.Settings
@@ -56,7 +51,6 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -67,7 +61,6 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -89,6 +82,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavType
@@ -116,6 +111,7 @@ import com.stenograf.app.i18n.LocalStrings
 import com.stenograf.app.service.LiveRecordingUiState
 import com.stenograf.app.service.ProcessingStatus
 import com.stenograf.app.service.RecordingForegroundService
+import com.stenograf.app.ui.components.ImportAudioSheet
 import com.stenograf.app.ui.components.LiquidGlassTab
 import com.stenograf.app.ui.components.VantaLiquidGlassDock
 import com.stenograf.app.ui.screens.DetailScreen
@@ -131,24 +127,29 @@ import com.stenograf.app.ui.theme.StenografTheme
 import com.stenograf.app.ui.theme.VantaType
 import com.stenograf.app.ui.theme.vantaSurfaceCard
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CancellationException
-import com.stenograf.app.ui.components.SectionHeader
-import com.stenograf.app.ui.components.SheetOptionRow
-import com.stenograf.app.ui.components.StatusPill
-import com.stenograf.app.ui.components.VantaBottomSheet
-import com.stenograf.app.ui.components.VantaPrimaryButton
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import java.io.File
 
-private sealed interface PendingSafSave {
-    data class ExportDoc(val recording: RecordingEntity, val format: ExportFormat) : PendingSafSave
-    data class AudioFile(val recording: RecordingEntity, val file: File) : PendingSafSave
-}
+private data class PendingSafSave(val recordingId: Long, val format: ExportFormat?)
+
+private val pendingSafSaveSaver = listSaver<PendingSafSave?, Any>(
+    save = { pending ->
+        if (pending == null) emptyList() else listOf(pending.recordingId, pending.format?.name.orEmpty())
+    },
+    restore = { values ->
+        PendingSafSave(values[0] as Long, ExportFormat.entries.firstOrNull { it.name == values[1] })
+    }
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -181,19 +182,17 @@ class MainActivity : ComponentActivity() {
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             boundService = (service as? RecordingForegroundService.LocalBinder)?.getService()
-            serviceBound = boundService != null
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             boundService = null
-            serviceBound = false
         }
     }
 
     override fun onStart() {
         super.onStart()
         val intent = Intent(this, RecordingForegroundService::class.java)
-        bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        serviceBound = bindService(intent, connection, Context.BIND_AUTO_CREATE)
     }
 
     override fun onStop() {
@@ -201,6 +200,7 @@ class MainActivity : ComponentActivity() {
         if (serviceBound) {
             unbindService(connection)
             serviceBound = false
+            boundService = null
         }
     }
 
@@ -208,7 +208,7 @@ class MainActivity : ComponentActivity() {
         installSplashScreen()
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        incomingMediaUri = extractIncomingMediaUri(intent)
+        if (savedInstanceState == null) incomingMediaUri = extractIncomingMediaUri(intent)
         val app = application as StenografApp
 
         setContent {
@@ -263,7 +263,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun StenografRoot(
     app: StenografApp,
@@ -285,6 +284,8 @@ private fun StenografRoot(
         RecordingForegroundService.uiState.map { state ->
             LiveRecordingUiState(
                 isActive = state.isActive,
+                isStarting = state.isStarting,
+                isFinishing = state.isFinishing,
                 isPaused = state.isPaused,
                 durationMs = (state.durationMs / 1000L) * 1000L,
                 waveform = emptyList(),
@@ -294,23 +295,38 @@ private fun StenografRoot(
         }.distinctUntilChanged()
     }
 
-    var selectedFolderId by remember { mutableStateOf<Long?>(null) }
-    var searchQuery by remember { mutableStateOf("") }
-    var sort by remember { mutableStateOf(RecordingSort.DATE_DESC) }
+    var selectedFolderId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var sort by rememberSaveable { mutableStateOf(RecordingSort.DATE_DESC) }
 
     var importJob by remember { mutableStateOf<Job?>(null) }
     var importProgress by remember { mutableStateOf<ProcessingStatus?>(null) }
-    var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingImportUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     var reTranscribeJob by remember { mutableStateOf<Job?>(null) }
+    val transcriptionMutex = remember { Mutex() }
+    var transcribingRecordingId by remember { mutableStateOf<Long?>(null) }
+    var resettingApp by remember { mutableStateOf(false) }
     var reTranscribeProgress by remember { mutableStateOf<ProcessingStatus?>(null) }
 
-    var pendingStartRecording by remember { mutableStateOf(false) }
-    var pendingModelImportTargetId by remember { mutableStateOf<String?>(null) }
-    var pendingSafSave by remember { mutableStateOf<PendingSafSave?>(null) }
+    var pendingStartRecording by rememberSaveable { mutableStateOf(false) }
+    var pendingModelImportTargetId by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingSafSave by rememberSaveable(stateSaver = pendingSafSaveSaver) {
+        mutableStateOf<PendingSafSave?>(null)
+    }
     var storageRefreshTick by remember { mutableIntStateOf(0) }
     var isCheckingUpdates by remember { mutableStateOf(false) }
 
     val activeFolderForNew = selectedFolderId?.takeIf { it > 0L }
+
+    fun openRecording(requestStart: Boolean) {
+        try {
+            if (requestStart) RecordingForegroundService.startNewRecording(context, activeFolderForNew)
+            navController.navigate("recording") { launchSingleTop = true }
+        } catch (failure: Exception) {
+            android.util.Log.w("Vanta", "Could not open recording", failure)
+            scope.launch { snackbarHostState.showSnackbar(s.micAccessFailed) }
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -319,8 +335,7 @@ private fun StenografRoot(
             ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         if (micGranted && pendingStartRecording) {
             pendingStartRecording = false
-            RecordingForegroundService.startNewRecording(context, activeFolderForNew)
-            navController.navigate("recording") { launchSingleTop = true }
+            openRecording(requestStart = true)
         } else if (!micGranted) {
             pendingStartRecording = false
             scope.launch { snackbarHostState.showSnackbar(s.micPermissionRequired) }
@@ -341,16 +356,58 @@ private fun StenografRoot(
         val active = RecordingForegroundService.uiState.value
         val recent = app.repository.getRecording(record.id) ?: error(s.audioFileNotFound)
         val current = if (active.recordingId == recent.id) recent.copy(languagePresetId = active.languagePresetId) else recent
+        val latestSettings = app.preferences.settingsFlow.first()
         if (model == null) {
             val preset = GroqAsrClient.resolveLocalReviewPreset(current.languagePresetId, forceRussian)
-            return app.reTranscribeWorker.recognizeBlockLocally(current, requireNotNull(paragraph), preset, onProgress)
+            return app.reTranscribeWorker.recognizeBlockLocally(
+                current, requireNotNull(paragraph), preset, latestSettings.neuralNoiseSuppression, onProgress
+            )
         }
-        val latestSettings = app.preferences.settingsFlow.first()
         val languageMode = GroqAsrClient.resolveReviewLanguageMode(forceRussian, groqLanguageOverride)
         return app.reTranscribeWorker.reviewAudio(
             current, paragraph, latestSettings.groqApiKey, latestSettings.groqModelId,
-            model, languageMode, previous, following, hint, onProgress
+            model, languageMode, previous, following, hint, latestSettings.neuralNoiseSuppression, onProgress
         )
+    }
+
+    fun runReTranscribeJob(
+        recordingId: Long,
+        block: suspend (AppSettings, (ProcessingStatus) -> Unit) -> Result<Unit>
+    ) {
+        if (resettingApp) return
+        val previous = reTranscribeJob
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            val currentJob = coroutineContext[Job]
+            try {
+                previous?.cancelAndJoin()
+                val latestSettings = app.preferences.settingsFlow.first()
+                val res = transcriptionMutex.withLock {
+                    block(latestSettings) { status ->
+                        if (reTranscribeJob === currentJob) reTranscribeProgress = status
+                    }
+                }
+                storageRefreshTick++
+                res.onSuccess {
+                    snackbarHostState.showSnackbar(s.reTranscribeDone)
+                }.onFailure { err ->
+                    snackbarHostState.showSnackbar(err.message ?: s.asrSessionError)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                snackbarHostState.showSnackbar(failure.message ?: s.asrSessionError)
+            } finally {
+                if (reTranscribeJob === currentJob) {
+                    reTranscribeProgress = null
+                    reTranscribeJob = null
+                    transcribingRecordingId = null
+                }
+            }
+        }
+        transcribingRecordingId = recordingId
+        reTranscribeProgress = ProcessingStatus(0f, s.loadingModelProgress)
+        reTranscribeJob = job
+        job.start()
     }
 
     fun launchLocalReTranscribe(
@@ -358,76 +415,38 @@ private fun StenografRoot(
         presetId: String,
         beam: Int,
         onlyTail: Boolean
-    ) {
-        reTranscribeJob?.cancel()
-        reTranscribeProgress = null
-        reTranscribeJob = scope.launch {
-            val currentJob = coroutineContext[Job]
-            try {
-                val latestSettings = runCatching { app.preferences.settingsFlow.first() }.getOrDefault(settings)
-                val res = app.reTranscribeWorker.reTranscribeRecording(
-                    recording = rec,
-                    presetId = presetId,
-                    requestedThreads = latestSettings.asrThreads,
-                    beam = beam,
-                    autoParagraph = latestSettings.autoParagraph,
-                    onlyUnprocessedTail = onlyTail,
-                    distantSpeechBoost = latestSettings.distantSpeechBoost,
-                    speakerDiarization = latestSettings.speakerDiarization,
-                    onProgress = { status ->
-                        if (reTranscribeJob === currentJob) reTranscribeProgress = status
-                    }
-                )
-                storageRefreshTick++
-                res.onSuccess {
-                    snackbarHostState.showSnackbar(s.reTranscribeDone)
-                }.onFailure { err ->
-                    snackbarHostState.showSnackbar(err.message ?: s.asrSessionError)
-                }
-            } finally {
-                if (reTranscribeJob === currentJob) {
-                    reTranscribeProgress = null
-                    reTranscribeJob = null
-                }
-            }
-        }
+    ) = runReTranscribeJob(rec.id) { latestSettings, onProgress ->
+        app.reTranscribeWorker.reTranscribeRecording(
+            recording = rec,
+            presetId = presetId,
+            requestedThreads = latestSettings.asrThreads,
+            beam = beam,
+            autoParagraph = latestSettings.autoParagraph,
+            onlyUnprocessedTail = onlyTail,
+            distantSpeechBoost = latestSettings.distantSpeechBoost,
+            neuralNoiseSuppression = latestSettings.neuralNoiseSuppression,
+            speakerDiarization = latestSettings.speakerDiarization,
+            autoLearnSpeakers = latestSettings.autoLearnSpeakers,
+            onProgress = onProgress
+        )
     }
 
     fun launchGroqReTranscribe(
         rec: RecordingEntity,
         onlyTail: Boolean,
         languageModeOverride: String? = null
-    ) {
-        reTranscribeJob?.cancel()
-        reTranscribeProgress = null
-        reTranscribeJob = scope.launch {
-            val currentJob = coroutineContext[Job]
-            try {
-                val latestSettings = runCatching { app.preferences.settingsFlow.first() }.getOrDefault(settings)
-                val res = app.reTranscribeWorker.reTranscribeWithGroq(
-                    recording = rec,
-                    apiKey = latestSettings.groqApiKey,
-                    modelId = latestSettings.groqModelId,
-                    languageMode = languageModeOverride ?: latestSettings.groqLanguageMode,
-                    speakerDiarization = latestSettings.speakerDiarization,
-                    onlyUnprocessedTail = onlyTail,
-                    onProgress = { status ->
-                        if (reTranscribeJob === currentJob) reTranscribeProgress = status
-                    }
-                )
-                storageRefreshTick++
-                res.onSuccess {
-                    snackbarHostState.showSnackbar(s.reTranscribeDone)
-                }.onFailure { err ->
-                    snackbarHostState.showSnackbar(err.message ?: s.asrSessionError)
-                }
-            } finally {
-                if (reTranscribeJob === currentJob) {
-                    reTranscribeProgress = null
-                    reTranscribeJob = null
-                }
-            }
-        }
+    ) = runReTranscribeJob(rec.id) { latestSettings, onProgress ->
+        app.reTranscribeWorker.reTranscribeWithGroq(
+            recording = rec,
+            apiKey = latestSettings.groqApiKey,
+            modelId = latestSettings.groqModelId,
+            languageMode = languageModeOverride ?: latestSettings.groqLanguageMode,
+            speakerDiarization = latestSettings.speakerDiarization,
+            neuralNoiseSuppression = latestSettings.neuralNoiseSuppression,
+            autoLearnSpeakers = latestSettings.autoLearnSpeakers,
+            onlyUnprocessedTail = onlyTail,
+            onProgress = onProgress
+        )
     }
 
     fun launchStreamingImportTranscribe(
@@ -436,42 +455,23 @@ private fun StenografRoot(
         groqLanguageMode: String,
         presetId: String,
         beam: Int
-    ) {
-        reTranscribeJob?.cancel()
-        reTranscribeProgress = null
-        reTranscribeJob = scope.launch {
-            val currentJob = coroutineContext[Job]
-            try {
-                val latestSettings = runCatching { app.preferences.settingsFlow.first() }.getOrDefault(settings)
-                val res = app.reTranscribeWorker.streamTranscribeImportedRecording(
-                    recording = rec,
-                    useGroqApi = useGroq,
-                    groqApiKey = latestSettings.groqApiKey,
-                    groqModelId = latestSettings.groqModelId,
-                    groqLanguageMode = groqLanguageMode,
-                    presetId = presetId,
-                    requestedThreads = latestSettings.asrThreads,
-                    beam = beam,
-                    autoParagraph = latestSettings.autoParagraph,
-                    distantSpeechBoost = latestSettings.distantSpeechBoost,
-                    speakerDiarization = latestSettings.speakerDiarization,
-                    onProgress = { status ->
-                        if (reTranscribeJob === currentJob) reTranscribeProgress = status
-                    }
-                )
-                storageRefreshTick++
-                res.onSuccess {
-                    snackbarHostState.showSnackbar(s.reTranscribeDone)
-                }.onFailure { err ->
-                    snackbarHostState.showSnackbar(err.message ?: s.asrSessionError)
-                }
-            } finally {
-                if (reTranscribeJob === currentJob) {
-                    reTranscribeProgress = null
-                    reTranscribeJob = null
-                }
-            }
-        }
+    ) = runReTranscribeJob(rec.id) { latestSettings, onProgress ->
+        app.reTranscribeWorker.streamTranscribeImportedRecording(
+            recording = rec,
+            useGroqApi = useGroq,
+            groqApiKey = latestSettings.groqApiKey,
+            groqModelId = latestSettings.groqModelId,
+            groqLanguageMode = groqLanguageMode,
+            presetId = presetId,
+            requestedThreads = latestSettings.asrThreads,
+            beam = beam,
+            autoParagraph = latestSettings.autoParagraph,
+            distantSpeechBoost = latestSettings.distantSpeechBoost,
+            neuralNoiseSuppression = latestSettings.neuralNoiseSuppression,
+            speakerDiarization = latestSettings.speakerDiarization,
+            autoLearnSpeakers = latestSettings.autoLearnSpeakers,
+            onProgress = onProgress
+        )
     }
 
     fun importMediaUri(
@@ -481,19 +481,28 @@ private fun StenografRoot(
         presetId: String = settings.languagePresetId,
         beam: Int = settings.asrBeam
     ) {
-        importJob?.cancel()
-        importProgress = null
-        importJob = scope.launch {
+        if (resettingApp) return
+        val previous = importJob
+        val importStartedAt = System.currentTimeMillis()
+        val copying = ProcessingStatus(0f, s.importAudio, startedAtMs = importStartedAt, isIndeterminate = true)
+        importProgress = copying
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             val currentJob = coroutineContext[Job]
             try {
-                val latestSettings = runCatching { app.preferences.settingsFlow.first() }.getOrDefault(settings)
+                previous?.cancelAndJoin()
+                val latestSettings = app.preferences.settingsFlow.first()
                 val useGroq = useGroqApi && latestSettings.groqApiKey.isNotBlank()
                 val modelId = if (useGroq) latestSettings.groqModelId else TinyAsrCatalog.findPreset(presetId).modelId
                 val res = app.reTranscribeWorker.prepareImportedRecording(
                     uri = uri,
                     presetId = presetId,
                     folderId = activeFolderForNew,
-                    modelId = modelId
+                    modelId = modelId,
+                    onProgress = { fraction ->
+                        if (importJob === currentJob) {
+                            importProgress = copying.copy(progress = fraction, isIndeterminate = false)
+                        }
+                    }
                 )
                 storageRefreshTick++
                 res.onSuccess { rec ->
@@ -514,6 +523,10 @@ private fun StenografRoot(
                 }.onFailure { err ->
                     snackbarHostState.showSnackbar("${s.importError}: ${err.message}")
                 }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                snackbarHostState.showSnackbar(failure.message ?: s.importError)
             } finally {
                 if (importJob === currentJob) {
                     importProgress = null
@@ -521,6 +534,8 @@ private fun StenografRoot(
                 }
             }
         }
+        importJob = job
+        job.start()
     }
 
     LaunchedEffect(incomingMediaUri) {
@@ -559,34 +574,46 @@ private fun StenografRoot(
     }
 
     val safCreateDocLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("*/*")
-    ) { uri: Uri? ->
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
         val pending = pendingSafSave
         pendingSafSave = null
-        if (uri != null && pending != null) {
+        val uri = result.data?.data
+        if (result.resultCode == android.app.Activity.RESULT_OK && uri != null && pending != null) {
             scope.launch {
                 try {
-                    when (pending) {
-                        is PendingSafSave.ExportDoc -> {
-                            val paras = app.repository.getParagraphs(pending.recording.id)
-                            TranscriptExporter.exportToUri(
-                                context = context,
-                                destUri = uri,
-                                recording = pending.recording,
-                                paragraphs = paras,
-                                format = pending.format,
-                                includeTimestamps = settings.showTimestamps
-                            )
-                        }
-                        is PendingSafSave.AudioFile -> {
-                            TranscriptExporter.copyAudioFileToUri(context, pending.file, uri)
-                        }
+                    val recording = app.repository.getRecording(pending.recordingId) ?: error(s.audioFileNotFound)
+                    val format = pending.format
+                    if (format == null) {
+                        TranscriptExporter.copyAudioFileToUri(context, File(recording.audioPath), uri)
+                    } else {
+                        TranscriptExporter.exportToUri(
+                            context, uri, recording, app.repository.getParagraphs(recording.id),
+                            format, settings.showTimestamps
+                        )
                     }
                     snackbarHostState.showSnackbar(s.exportSavedSuccess)
-                } catch (t: Throwable) {
-                    snackbarHostState.showSnackbar("${s.exportError}: ${t.message}")
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    snackbarHostState.showSnackbar(failure.message ?: s.exportError)
                 }
             }
+        }
+    }
+
+    fun launchSafSave(pending: PendingSafSave, name: String, mimeType: String) {
+        pendingSafSave = pending
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = mimeType
+            putExtra(Intent.EXTRA_TITLE, name)
+        }
+        try {
+            safCreateDocLauncher.launch(intent)
+        } catch (failure: Exception) {
+            pendingSafSave = null
+            scope.launch { snackbarHostState.showSnackbar(failure.message ?: s.exportError) }
         }
     }
 
@@ -605,6 +632,12 @@ private fun StenografRoot(
     }
 
     fun startRecordingFlow() {
+        if (resettingApp || pendingStartRecording) return
+        val live = RecordingForegroundService.uiState.value
+        if (live.isStarting || live.isActive || live.isFinishing) {
+            openRecording(requestStart = false)
+            return
+        }
         val hasMic = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val needNotif = Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -616,8 +649,7 @@ private fun StenografRoot(
             }.toTypedArray()
             permissionLauncher.launch(perms)
         } else {
-            RecordingForegroundService.startNewRecording(context, activeFolderForNew)
-            navController.navigate("recording") { launchSingleTop = true }
+            openRecording(requestStart = true)
         }
     }
 
@@ -633,16 +665,17 @@ private fun StenografRoot(
                     includeTimestamps = settings.showTimestamps
                 )
                 TranscriptExporter.shareFile(context, outFile, format.mimeType, "${s.exportTitle} ${format.ext.uppercase()}")
-            } catch (t: Throwable) {
-                snackbarHostState.showSnackbar("${s.exportError}: ${t.message}")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                snackbarHostState.showSnackbar(failure.message ?: s.exportError)
             }
         }
     }
 
     fun saveExportWithSaf(rec: RecordingEntity, format: ExportFormat) {
-        pendingSafSave = PendingSafSave.ExportDoc(rec, format)
         val suggestedName = "${TranscriptExporter.safeBaseName(rec.title)}.${format.ext}"
-        safCreateDocLauncher.launch(suggestedName)
+        launchSafSave(PendingSafSave(rec.id, format), suggestedName, format.mimeType)
     }
 
     val libraryPage: @Composable (Int, Dp, (Boolean) -> Unit) -> Unit = { scrollToTopRequest, bottomDockClearance, onSelectionModeChange ->
@@ -698,8 +731,6 @@ private fun StenografRoot(
             },
             onCancelImport = {
                 importJob?.cancel()
-                importJob = null
-                importProgress = null
             },
             onOpenRecording = { id -> navController.navigate("detail/$id") },
             onRenameRecording = { rec, title ->
@@ -716,7 +747,10 @@ private fun StenografRoot(
             onDeleteRecordings = { list ->
                 scope.launch {
                     try {
-                        list.forEach { app.repository.deleteRecording(it) }
+                        if (list.any { it.id == transcribingRecordingId }) reTranscribeJob?.cancelAndJoin()
+                        transcriptionMutex.withLock {
+                            list.forEach { app.repository.deleteRecording(it) }
+                        }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -753,21 +787,26 @@ private fun StenografRoot(
     
     }
 
-    val settingsPage: @Composable ((() -> Unit)?, Dp, () -> Unit) -> Unit = { onBack, bottomDockClearance, openModels ->
-        val dlStates by app.modelManager.downloadStates.collectAsState()
-        val updates by app.modelManager.updatesAvailable.collectAsState()
-        val statuses by produceState<List<ModelInstallStatus>>(emptyList(), dlStates, updates, storageRefreshTick) {
-            value = withContext(Dispatchers.IO) { app.modelManager.getAllModelStatuses() }
-        }
-        val storageBreakdown by produceState(
-            com.stenograf.app.data.repo.StorageBreakdown(0L, 0L, 0L, 0L, 0L), storageRefreshTick
-        ) {
-            value = withContext(Dispatchers.IO) { app.repository.getStorageBreakdown(app.modelManager) }
-        }
+    val dlStates by app.modelManager.downloadStates.collectAsState()
+    val updates by app.modelManager.updatesAvailable.collectAsState()
+    var modelStatuses by remember { mutableStateOf<List<ModelInstallStatus>>(emptyList()) }
+    LaunchedEffect(dlStates, updates, storageRefreshTick) {
+        modelStatuses = withContext(Dispatchers.IO) { app.modelManager.getAllModelStatuses() }
+    }
+    var storageBreakdown by remember {
+        mutableStateOf(com.stenograf.app.data.repo.StorageBreakdown(0L, 0L, 0L, 0L, 0L))
+    }
+    LaunchedEffect(storageRefreshTick) {
+        storageBreakdown = withContext(Dispatchers.IO) { app.repository.getStorageBreakdown(app.modelManager) }
+    }
+    val speakerProfiles by remember(app) { app.repository.observeSpeakerProfiles() }
+        .collectAsStateWithLifecycle(initialValue = emptyList())
+    val liveUiState by RecordingForegroundService.uiState.collectAsStateWithLifecycle()
 
+    val settingsPage: @Composable ((() -> Unit)?, Dp, () -> Unit) -> Unit = { onBack, bottomDockClearance, openModels ->
         SettingsScreen(
             settings = settings,
-            modelStatuses = statuses,
+            modelStatuses = modelStatuses,
             storage = storageBreakdown,
             onBack = onBack,
             bottomDockClearance = bottomDockClearance,
@@ -791,44 +830,95 @@ private fun StenografRoot(
             onSelectGroqModel = { modelId -> scope.launch { app.preferences.setGroqModelId(modelId) } },
             onSelectGroqLanguageMode = { mode -> scope.launch { app.preferences.setGroqLanguageMode(mode) } },
             onToggleSpeakers = { enabled -> scope.launch { app.preferences.setSpeakerDiarization(enabled) } },
+            onSelectRecognitionAudioFilter = { filter -> scope.launch { app.preferences.setRecognitionAudioFilter(filter) } },
+            onToggleAutoLearnSpeakers = { enabled -> scope.launch { app.preferences.setAutoLearnSpeakers(enabled) } },
+            speakerProfiles = speakerProfiles,
+            isRecordingActive = liveUiState.isActive,
+            onEnrollPcmVoiceProfile = { name, tagOrPhone, pcmBytes, existingId ->
+                app.repository.enrollOrReinforceFromPcm16(
+                    name = name,
+                    tagOrPhone = tagOrPhone,
+                    pcm16kBytes = pcmBytes,
+                    existingProfileId = existingId,
+                    sourceTitle = com.stenograf.app.i18n.AppLocaleManager.currentExtraStrings().micEnrollSourceTitle
+                ) != null
+            },
+            onUpdateVoiceProfileDetails = { id, newName, tagOrPhone, renamePast ->
+                scope.launch { app.repository.updateSpeakerProfileDetails(id, newName, tagOrPhone, renamePast) }
+            },
+            onMergeVoiceProfiles = { targetId, sourceId ->
+                scope.launch { app.repository.mergeSpeakerProfiles(targetId, sourceId, renameInRecordings = true) }
+            },
+            onEnsureVoiceSampleClip = { id ->
+                app.repository.ensureProfileAudioSample(id)
+            },
+            onOpenSourceRecording = { recId ->
+                navController.navigate("detail/$recId")
+            },
+            onDeleteVoiceProfile = { id ->
+                scope.launch { app.repository.deleteSpeakerProfile(id) }
+            },
+            onShowMessage = { msg -> scope.launch { snackbarHostState.showSnackbar(msg) } },
             onOpenModelManager = openModels,
             onClearCache = {
                 scope.launch {
-                    app.repository.clearTemporaryCache(app.modelManager)
-                    storageRefreshTick++
-                    snackbarHostState.showSnackbar(s.cacheClearedNotice)
+                    if (!resettingApp) {
+                        app.repository.clearTemporaryCache(app.modelManager)
+                        storageRefreshTick++
+                        snackbarHostState.showSnackbar(s.cacheClearedNotice)
+                    }
                 }
             },
             onResetAllData = {
                 scope.launch {
-                    if (RecordingForegroundService.uiState.value.isActive) {
-                        getService()?.stopRecording()
-                            ?: RecordingForegroundService.sendAction(context, RecordingForegroundService.ACTION_STOP)
+                    if (resettingApp) return@launch
+                    val live = RecordingForegroundService.uiState.value
+                    if (live.isStarting || live.isActive || live.isFinishing) {
+                        snackbarHostState.showSnackbar(
+                            if (AppLocaleManager.currentLanguage.value.code == "ru") {
+                                "Сначала завершите запись."
+                            } else "Finish the recording first."
+                        )
+                        return@launch
                     }
-                    importJob?.cancel()
-                    importJob = null
-                    importProgress = null
-                    reTranscribeJob?.cancel()
-                    reTranscribeJob = null
-                    reTranscribeProgress = null
-                    app.repository.resetAllAppData(app.modelManager, app.preferences)
-                    storageRefreshTick++
-                    snackbarHostState.showSnackbar(s.resetAllDataDone)
+                    resettingApp = true
+                    try {
+                        importJob?.cancelAndJoin()
+                        reTranscribeJob?.cancelAndJoin()
+                        transcriptionMutex.withLock {
+                            app.repository.resetAllAppData(app.modelManager, app.preferences)
+                        }
+                        storageRefreshTick++
+                        snackbarHostState.showSnackbar(s.resetAllDataDone)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (failure: Exception) {
+                        snackbarHostState.showSnackbar(failure.message ?: s.asrSessionError)
+                    } finally {
+                        resettingApp = false
+                    }
                 }
             }
         )
     
     }
 
-    val modelsPage: @Composable ((() -> Unit)?, Dp) -> Unit = { onBack, bottomDockClearance ->
-        val dlStates by app.modelManager.downloadStates.collectAsState()
-        val updates by app.modelManager.updatesAvailable.collectAsState()
-        val statuses by produceState<List<ModelInstallStatus>>(emptyList(), dlStates, updates, storageRefreshTick) {
-            value = withContext(Dispatchers.IO) { app.modelManager.getAllModelStatuses() }
+    fun downloadModel(modelId: String) {
+        if (resettingApp) return
+        scope.launch {
+            val result = app.modelManager.downloadModel(modelId)
+            storageRefreshTick++
+            result.onFailure { failure ->
+                if (failure !is CancellationException) {
+                    snackbarHostState.showSnackbar(failure.message ?: s.modelDownloadError)
+                }
+            }
         }
+    }
 
+    val modelsPage: @Composable ((() -> Unit)?, Dp) -> Unit = { onBack, bottomDockClearance ->
         ModelManagerScreen(
-            modelStatuses = statuses,
+            modelStatuses = modelStatuses,
             activePresetId = settings.languagePresetId,
             onSelectPreset = { id ->
                 scope.launch { app.preferences.setLanguagePreset(id) }
@@ -844,19 +934,9 @@ private fun StenografRoot(
                     storageRefreshTick++
                 }
             },
-            onDownloadModel = { modelId ->
-                scope.launch {
-                    val res = app.modelManager.downloadModel(modelId)
-                    storageRefreshTick++
-                    res.onSuccess {
-                        snackbarHostState.showSnackbar(s.modelDownloadedNotice)
-                    }.onFailure { err ->
-                        if (err !is kotlinx.coroutines.CancellationException) {
-                            snackbarHostState.showSnackbar(err.message ?: s.modelDownloadError)
-                        }
-                    }
-                }
-            },
+            recognitionFilter = settings.recognitionAudioFilter,
+            onSelectRecognitionFilter = { filter -> scope.launch { app.preferences.setRecognitionAudioFilter(filter) } },
+            onDownloadModel = ::downloadModel,
             onPauseDownload = { modelId ->
                 app.modelManager.pauseDownload(modelId)
             },
@@ -1017,8 +1097,9 @@ private fun StenografRoot(
                         initialValue = source.value.copy(waveform = emptyList(), committedParagraphs = emptyList())
                     )
                     val liveParagraphFlow = remember(recordingState.recordingId) {
-                        recordingState.recordingId?.let { app.repository.observeParagraphs(it) }
-                            ?: kotlinx.coroutines.flow.flowOf(emptyList())
+                        val id = recordingState.recordingId
+                        if (id > 0L) app.repository.observeParagraphs(id)
+                        else kotlinx.coroutines.flow.flowOf(emptyList())
                     }
                     val liveParagraphs by liveParagraphFlow.collectAsStateWithLifecycle(initialValue = emptyList())
                     RecordingScreen(
@@ -1087,9 +1168,7 @@ private fun StenografRoot(
 
                     LaunchedEffect(recording?.audioPath) {
                         val path = recording?.audioPath
-                        if (!path.isNullOrBlank()) {
-                            player.load(path)
-                        }
+                        if (path.isNullOrBlank()) player.release() else player.load(path)
                     }
 
                     DisposableEffect(Unit) {
@@ -1103,8 +1182,9 @@ private fun StenografRoot(
                         showTimestamps = settings.showTimestamps,
                         readerSerif = settings.readerSerif,
                         readerFontSizeTier = settings.readerFontSizeTier,
-                        reTranscribeProgress = reTranscribeProgress,
+                        reTranscribeProgress = reTranscribeProgress.takeIf { transcribingRecordingId == recId },
                         modelManager = app.modelManager,
+                        onDownloadAudioModel = ::downloadModel,
                         groqApiKey = settings.groqApiKey,
                         reviewModelId = settings.transcriptReviewModelId,
                         onSelectReviewModel = { model ->
@@ -1134,7 +1214,8 @@ private fun StenografRoot(
                                 player.release()
                                 scope.launch {
                                     try {
-                                        app.repository.deleteRecording(rec)
+                                        if (transcribingRecordingId == rec.id) reTranscribeJob?.cancelAndJoin()
+                                        transcriptionMutex.withLock { app.repository.deleteRecording(rec) }
                                         storageRefreshTick++
                                         if (navController.currentBackStackEntry == backStackEntry) navController.popBackStack()
                                     } catch (e: CancellationException) {
@@ -1149,10 +1230,27 @@ private fun StenografRoot(
                         onTogglePlayPause = { player.togglePlayPause() },
                         onSeekToMs = { ms, autoPlay -> player.seekTo(ms, autoPlay) },
                         onSeekByMs = { delta -> player.seekBy(delta) },
+                        onPreviewSpeechGap = { gap -> player.previewRange(gap.startMs, gap.endMs) },
+                        onStopSpeechPreview = player::stopPreview,
+                        onInsertRecoveredSpeech = { gap, words ->
+                            val rec = recording
+                            rec != null && transcribingRecordingId != rec.id &&
+                                app.repository.insertRecoveredSpeech(rec, gap, words)
+                        },
                         onSetSpeed = { spd -> player.setSpeed(spd) },
                         onToggleLoudnessBoost = { player.toggleLoudnessBoost() },
                         onUpdateParagraphText = { para, text ->
-                            scope.launch { app.repository.updateParagraphTextAndRefreshSummary(para, text) }
+                            scope.launch {
+                                try {
+                                    if (!app.repository.updateParagraphTextAndRefreshSummary(para, text)) {
+                                        snackbarHostState.showSnackbar(s.transcriptChangedRetry)
+                                    }
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (failure: Exception) {
+                                    snackbarHostState.showSnackbar(failure.message ?: s.asrSessionError)
+                                }
+                            }
                         },
                         onToggleParagraphBookmark = { para, label ->
                             scope.launch { app.repository.toggleParagraphBookmark(para, label) }
@@ -1177,9 +1275,7 @@ private fun StenografRoot(
                             launchGroqReTranscribe(rec, onlyTail, langMode)
                         },
                         onCancelReTranscribe = {
-                            reTranscribeJob?.cancel()
-                            reTranscribeJob = null
-                            reTranscribeProgress = null
+                            if (transcribingRecordingId == recId) reTranscribeJob?.cancel()
                         },
                         onExport = { fmt ->
                             recording?.let { exportAndShareRecording(it, fmt) }
@@ -1191,9 +1287,12 @@ private fun StenografRoot(
                             val rec = recording
                             if (rec != null && rec.audioPath.isNotBlank()) {
                                 val file = File(rec.audioPath)
-                                if (file.exists()) {
-                                    val mime = if (rec.audioPath.endsWith(".m4a")) "audio/mp4" else "audio/wav"
-                                    TranscriptExporter.shareFile(context, file, mime, s.shareAudio)
+                                if (file.isFile && file.length() > 0L) {
+                                    try {
+                                        TranscriptExporter.shareFile(context, file, TranscriptExporter.mediaMimeType(file), s.shareAudio)
+                                    } catch (failure: Exception) {
+                                        scope.launch { snackbarHostState.showSnackbar(failure.message ?: s.exportError) }
+                                    }
                                 } else {
                                     scope.launch { snackbarHostState.showSnackbar(s.audioFileNotFound) }
                                 }
@@ -1203,10 +1302,10 @@ private fun StenografRoot(
                             val rec = recording
                             if (rec != null && rec.audioPath.isNotBlank()) {
                                 val file = File(rec.audioPath)
-                                if (file.exists()) {
-                                    val ext = if (rec.audioPath.endsWith(".m4a")) "m4a" else "wav"
-                                    pendingSafSave = PendingSafSave.AudioFile(rec, file)
-                                    safCreateDocLauncher.launch("${TranscriptExporter.safeBaseName(rec.title)}.$ext")
+                                if (file.isFile && file.length() > 0L) {
+                                    val name = TranscriptExporter.safeBaseName(rec.title)
+                                    val suggestedName = if (file.extension.isBlank()) name else "$name.${file.extension}"
+                                    launchSafSave(PendingSafSave(rec.id, null), suggestedName, TranscriptExporter.mediaMimeType(file))
                                 } else {
                                     scope.launch { snackbarHostState.showSnackbar(s.audioFileNotFound) }
                                 }
@@ -1218,6 +1317,19 @@ private fun StenografRoot(
                         onOpenModelManager = { navController.navigate("models") },
                         onShowMessage = { msg ->
                             scope.launch { snackbarHostState.showSnackbar(msg) }
+                        },
+                        speakerProfiles = speakerProfiles,
+                        onAssignSpeaker = { para, newName, applyAll, enrollVoiceprint ->
+                            scope.launch {
+                                app.repository.assignRecordingSpeakerAndLearn(
+                                    recordingId = recId,
+                                    targetParagraph = para,
+                                    oldSpeaker = para.speaker,
+                                    newName = newName,
+                                    applyToAllMatching = applyAll,
+                                    enrollVoiceprint = enrollVoiceprint
+                                )
+                            }
                         }
                     )
                 }
@@ -1231,170 +1343,23 @@ private fun StenografRoot(
             }
 
             pendingImportUri?.let { importUri ->
-                val colors = LocalStenografColors.current
-                var importPresetId by remember(importUri) { mutableStateOf(settings.languagePresetId) }
-                var importBeam by remember(importUri) { mutableIntStateOf(settings.asrBeam) }
-                var importGroqLang by remember(importUri) { mutableStateOf(settings.groqLanguageMode) }
-                val selectedPreset = TinyAsrCatalog.findPreset(importPresetId)
-                val modelInstalled = app.modelManager.isModelInstalled(selectedPreset.modelId) ||
-                    TinyAsrCatalog.findModel(selectedPreset.modelId).bundledInApk
-                val groqReady = settings.groqApiKey.isNotBlank()
-
-                VantaBottomSheet(
-                    onDismissRequest = { pendingImportUri = null },
-                    title = s.importAudio,
-                    subtitle = s.reTranscribeDesc,
-                    headerIcon = Icons.Rounded.AutoFixHigh
-                ) {
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 480.dp),
-                        verticalArrangement = Arrangement.spacedBy(Spacing.xs)
-                    ) {
-                        item {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .vantaSurfaceCard(colors, radius = Radius.md, elevated = false)
-                                    .padding(Spacing.md),
-                                verticalArrangement = Arrangement.spacedBy(Spacing.sm)
-                            ) {
-                                Text(
-                                    text = if (groqReady) "Groq API (${settings.groqModelId})" else "Groq API",
-                                    color = colors.accent,
-                                    style = VantaType.cardTitle
-                                )
-                                Text(
-                                    text = if (groqReady) {
-                                        "Быстрая облачная расшифровка Whisper."
-                                    } else {
-                                        "Укажите API-ключ Groq в настройках, чтобы использовать облачную расшифровку."
-                                    },
-                                    color = colors.textSecondary,
-                                    style = VantaType.bodySmall
-                                )
-                                if (groqReady) {
-                                    FlowRow(
-                                        horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
-                                        verticalArrangement = Arrangement.spacedBy(Spacing.xs)
-                                    ) {
-                                        listOf(
-                                            "auto" to "Авто",
-                                            "multi" to "RU + EN",
-                                            "ru" to "RU",
-                                            "en" to "EN",
-                                            "es" to "ES",
-                                            "de" to "DE",
-                                            "fr" to "FR",
-                                            "uk" to "UK"
-                                        ).forEach { (code, pillLabel) ->
-                                            StatusPill(
-                                                label = pillLabel,
-                                                containerColor = if (importGroqLang == code) colors.accentSoft else colors.surface,
-                                                contentColor = if (importGroqLang == code) colors.accent else colors.textSecondary,
-                                                onClick = { importGroqLang = code }
-                                            )
-                                        }
-                                    }
-                                    VantaPrimaryButton(
-                                        label = "Расшифровать через Groq API",
-                                        icon = Icons.Rounded.AutoFixHigh,
-                                        onClick = {
-                                            pendingImportUri = null
-                                            importMediaUri(
-                                                uri = importUri,
-                                                useGroqApi = true,
-                                                groqLanguageMode = importGroqLang,
-                                                presetId = importPresetId,
-                                                beam = importBeam
-                                            )
-                                        },
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
-                                } else {
-                                    TextButton(
-                                        onClick = {
-                                            pendingImportUri = null
-                                            navController.navigate("settings")
-                                        }
-                                    ) {
-                                        Text(s.settingsTitle, color = colors.accent)
-                                    }
-                                }
-                            }
-                            Spacer(Modifier.height(Spacing.sm))
-                        }
-
-                        item {
-                            SectionHeader(s.decodingAccuracyTitle)
-                            Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm)) {
-                                StatusPill(
-                                    label = s.accuracyBeam4,
-                                    containerColor = if (importBeam == 4) colors.accentSoft else colors.surface,
-                                    contentColor = if (importBeam == 4) colors.accent else colors.textSecondary,
-                                    onClick = { importBeam = 4 }
-                                )
-                                StatusPill(
-                                    label = s.fastGreedy1,
-                                    containerColor = if (importBeam == 1) colors.accentSoft else colors.surface,
-                                    contentColor = if (importBeam == 1) colors.accent else colors.textSecondary,
-                                    onClick = { importBeam = 1 }
-                                )
-                            }
-
-                            Spacer(Modifier.height(Spacing.sm))
-                            SectionHeader(s.reTranscribeModelLang)
-                        }
-
-                        items(TinyAsrCatalog.PRESETS.size) { idx ->
-                            val preset = TinyAsrCatalog.PRESETS[idx]
-                            val inst = app.modelManager.isModelInstalled(preset.modelId) ||
-                                TinyAsrCatalog.findModel(preset.modelId).bundledInApk
-                            SheetOptionRow(
-                                selected = preset.id == importPresetId,
-                                title = preset.label(s),
-                                subtitle = if (inst) preset.modelId else "${preset.modelId} · ${s.modelAvailableLabel}",
-                                onClick = { importPresetId = preset.id }
-                            )
-                        }
-
-                        item {
-                            Spacer(Modifier.height(Spacing.md))
-                            if (modelInstalled) {
-                                VantaPrimaryButton(
-                                    label = s.startAction,
-                                    onClick = {
-                                        pendingImportUri = null
-                                        importMediaUri(
-                                            uri = importUri,
-                                            useGroqApi = false,
-                                            presetId = importPresetId,
-                                            beam = importBeam
-                                        )
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                            } else {
-                                Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
-                                    Text(
-                                        text = s.modelRequiredInstallPrompt,
-                                        color = colors.warning,
-                                        style = VantaType.bodySmall
-                                    )
-                                    VantaPrimaryButton(
-                                        label = s.manageModelsTitle,
-                                        onClick = {
-                                            pendingImportUri = null
-                                            navController.navigate("models")
-                                        },
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
-                                }
-                            }
-                        }
+                ImportAudioSheet(
+                    importUri = importUri,
+                    settings = settings,
+                    modelManager = app.modelManager,
+                    onDismiss = { pendingImportUri = null },
+                    onOpenSettings = { navController.navigate("settings") },
+                    onOpenModelManager = { navController.navigate("models") },
+                    onStartImport = { useGroqApi, groqLanguageMode, presetId, beam ->
+                        importMediaUri(
+                            uri = importUri,
+                            useGroqApi = useGroqApi,
+                            groqLanguageMode = groqLanguageMode,
+                            presetId = presetId,
+                            beam = beam
+                        )
                     }
-                }
+                )
             }
         }
     }

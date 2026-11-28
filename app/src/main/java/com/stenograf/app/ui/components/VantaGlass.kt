@@ -135,9 +135,9 @@ internal fun VantaLiquidGlassDock(
     pagePositionProvider: () -> Float,
     settledIndex: Int,
     onSelect: (Int) -> Unit,
+    modifier: Modifier = Modifier,
     backdropLayer: GraphicsLayer? = null,
-    backdropOriginProvider: () -> Offset = { Offset.Zero },
-    modifier: Modifier = Modifier
+    backdropOriginProvider: () -> Offset = { Offset.Zero }
 ) {
     if (tabs.isEmpty()) return
     val colors = LocalStenografColors.current

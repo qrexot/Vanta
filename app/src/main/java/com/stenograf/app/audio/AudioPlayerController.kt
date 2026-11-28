@@ -35,6 +35,10 @@ class AudioPlayerController {
     private var loudnessEnhancer: LoudnessEnhancer? = null
     private var tickerJob: Job? = null
     private var generation = 0
+    private var previewEndMs: Long? = null
+    private var previewSeekMs: Long? = null
+    @Volatile private var lastManualSeekAtMs = 0L
+    @Volatile private var lastManualSeekTargetMs = 0L
 
     private val _state = MutableStateFlow(PlayerState())
     val state: StateFlow<PlayerState> = _state.asStateFlow()
@@ -78,8 +82,18 @@ class AudioPlayerController {
                     error = null
                 )
             }
+            mp.setOnSeekCompleteListener { source ->
+                val target = previewSeekMs ?: return@setOnSeekCompleteListener
+                if (source !== player || kotlin.math.abs(source.currentPosition.toLong() - target) > 250L) {
+                    return@setOnSeekCompleteListener
+                }
+                previewSeekMs = null
+                startPlayback(source)
+            }
             mp.setOnCompletionListener {
                 if (player !== it) return@setOnCompletionListener
+                previewEndMs = null
+                previewSeekMs = null
                 tickerJob?.cancel()
                 _state.value = _state.value.copy(
                     isPlaying = false,
@@ -88,8 +102,9 @@ class AudioPlayerController {
             }
             mp.setOnErrorListener { source, what, extra ->
                 if (player !== source) return@setOnErrorListener true
-                tickerJob?.cancel()
-                _state.value = _state.value.copy(
+                val failed = _state.value
+                release()
+                _state.value = failed.copy(
                     isPlaying = false,
                     isReady = false,
                     error = "${AppLocaleManager.currentStrings().playbackError} ($what/$extra)"
@@ -118,6 +133,8 @@ class AudioPlayerController {
     fun togglePlayPause() {
         val mp = player ?: return
         if (!_state.value.isReady) return
+        previewEndMs = null
+        previewSeekMs = null
         if (_state.value.isPlaying || mp.isPlaying) {
             runCatching { if (mp.isPlaying) mp.pause() }
             tickerJob?.cancel()
@@ -131,22 +148,52 @@ class AudioPlayerController {
     }
 
     fun seekTo(ms: Long, autoPlay: Boolean = false) {
+        previewEndMs = null
+        previewSeekMs = null
+        seek(ms, autoPlay)
+    }
+
+    fun previewRange(startMs: Long, endMs: Long) {
+        val mp = player ?: return
+        if (!_state.value.isReady || startMs >= _state.value.durationMs || endMs <= startMs) return
+        stopPreview()
+        if (mp.isPlaying) togglePlayPause()
+        previewEndMs = endMs.coerceAtMost(_state.value.durationMs)
+        previewSeekMs = startMs
+        seek(startMs, autoPlay = false)
+    }
+
+    fun stopPreview() {
+        if (previewEndMs == null) return
+        previewEndMs = null
+        previewSeekMs = null
+        val mp = player ?: return
+        if (_state.value.isReady && mp.isPlaying) togglePlayPause()
+    }
+
+    private fun seek(ms: Long, autoPlay: Boolean) {
         val mp = player ?: return
         if (!_state.value.isReady) return
         val clamped = ms.coerceIn(0L, _state.value.durationMs.coerceAtLeast(0L))
-        mp.seekTo(clamped.toInt())
-        _state.value = _state.value.copy(positionMs = clamped)
-        if (autoPlay && !mp.isPlaying) {
-            startPlayback(mp)
+        lastManualSeekTargetMs = clamped
+        lastManualSeekAtMs = android.os.SystemClock.elapsedRealtime()
+        runCatching {
+            mp.seekTo(clamped, MediaPlayer.SEEK_CLOSEST)
+        }.onFailure {
+            runCatching { mp.seekTo(clamped.toInt()) }
         }
+        _state.value = _state.value.copy(positionMs = clamped)
+        if (autoPlay && !_state.value.isPlaying) startPlayback(mp)
     }
 
     fun seekBy(deltaMs: Long) {
-        val current = player?.currentPosition?.toLong() ?: _state.value.positionMs
-        seekTo(current + deltaMs, autoPlay = false)
+        val state = _state.value
+        if (!state.isReady) return
+        seekTo(state.positionMs + deltaMs, autoPlay = false)
     }
 
     fun setSpeed(speed: Float) {
+        if (!speed.isFinite()) return
         val clamped = speed.coerceIn(0.5f, 2.5f)
         _state.value = _state.value.copy(speed = clamped)
         val mp = player ?: return
@@ -180,20 +227,21 @@ class AudioPlayerController {
 
     private fun startPlayback(mp: MediaPlayer) {
         val targetSpeed = _state.value.speed
-        if (targetSpeed != 1.0f) {
-            applySpeed(mp, targetSpeed)
-        } else {
-            runCatching {
-                if (mp.playbackParams.speed != 1.0f) {
-                    applySpeed(mp, 1.0f)
-                }
-            }
+        try {
+            val currentSpeed = runCatching { mp.playbackParams.speed }.getOrDefault(1.0f)
+            if (currentSpeed != targetSpeed) applySpeed(mp, targetSpeed)
+            if (!mp.isPlaying) mp.start()
+            _state.value = _state.value.copy(isPlaying = true, error = null)
+            startTicker()
+        } catch (failure: IllegalStateException) {
+            val failed = _state.value
+            release()
+            _state.value = failed.copy(
+                isReady = false,
+                isPlaying = false,
+                error = AppLocaleManager.currentStrings().playbackError
+            )
         }
-        if (!mp.isPlaying) {
-            mp.start()
-        }
-        _state.value = _state.value.copy(isPlaying = true)
-        startTicker()
     }
 
     private fun applySpeed(mp: MediaPlayer, speed: Float) {
@@ -209,19 +257,20 @@ class AudioPlayerController {
             while (isActive) {
                 val mp = player
                 if (mp != null && mp.isPlaying) {
-                    _state.value = _state.value.copy(positionMs = mp.currentPosition.toLong())
+                    val pos = mp.currentPosition.toLong()
+                    val end = previewEndMs
+                    if (end != null && pos >= end) {
+                        stopPreview()
+                        return@launch
+                    }
+                    val sinceManualSeek = android.os.SystemClock.elapsedRealtime() - lastManualSeekAtMs
+                    // Prevent a brief 1-2 frame backward highlight flicker while the async codec seek settles.
+                    if (sinceManualSeek >= 180L || kotlin.math.abs(pos - lastManualSeekTargetMs) <= 450L) {
+                        _state.value = _state.value.copy(positionMs = pos)
+                    }
                 }
                 delay(55L)
             }
-        }
-    }
-
-    fun pause() {
-        val mp = player ?: return
-        if (_state.value.isReady && mp.isPlaying) {
-            mp.pause()
-            tickerJob?.cancel()
-            _state.value = _state.value.copy(isPlaying = false, positionMs = mp.currentPosition.toLong())
         }
     }
 
@@ -231,6 +280,8 @@ class AudioPlayerController {
 
     fun release() {
         generation++
+        previewEndMs = null
+        previewSeekMs = null
         tickerJob?.cancel()
         tickerJob = null
         val enhancer = loudnessEnhancer

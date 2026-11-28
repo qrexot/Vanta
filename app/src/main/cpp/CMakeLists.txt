@@ -8,10 +8,11 @@ set_target_properties(tinyasr PROPERTIES
     IMPORTED_LOCATION "${TINYASR_LIB_DIR}/libtinyasr.a"
 )
 
-add_library(tinyasr_jni SHARED tinyasr_jni.cpp)
+add_library(tinyasr_jni SHARED tinyasr_jni.cpp audio_onnx_jni.cpp gigaam_v4_jni.cpp)
 
 target_include_directories(tinyasr_jni PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../native/tinyasr/include"
+    "${ONNX_HEADERS}"
 )
 
 target_link_libraries(tinyasr_jni

@@ -73,7 +73,13 @@ internal fun findSpeechBoundary(pcm: ByteArray): Int {
         }
         energy / (frame / 2)
     }
-    val silenceFloor = maxOf(180L * 180L, energies.sorted()[energies.size * 3 / 4] / 20)
+    val sortedEnergies = energies.sorted()
+    val noiseBaseline = sortedEnergies[(sortedEnergies.size / 10).coerceIn(0, sortedEnergies.lastIndex)]
+    val speechLevel = sortedEnergies[sortedEnergies.size * 3 / 4]
+    val contrastFloor = if (speechLevel > noiseBaseline * 4L) {
+        minOf((noiseBaseline * 3L) / 2L, speechLevel / 4L)
+    } else 0L
+    val silenceFloor = maxOf(180L * 180L, contrastFloor, speechLevel / 18)
     val quiet = (1 until energies.lastIndex).filter { i ->
         energies[i - 1] < silenceFloor && energies[i] < silenceFloor && energies[i + 1] < silenceFloor
     }.minByOrNull { kotlin.math.abs(SEARCH_START + it * frame - target) }
@@ -93,7 +99,7 @@ internal fun ownTranscriptWords(
         precedingWords.takeLast(count).zip(candidates.take(count)).all { (old, new) ->
             val key = normalized(old)
             key.isNotEmpty() && key == normalized(new) &&
-                kotlin.math.abs((old.start + old.end - new.start - new.end) / 2f - offset + prefix) <= 0.3f
+                kotlin.math.abs((old.start + old.end - new.start - new.end) / 2f - offset + prefix) <= 0.55f
         }
     } ?: 0
     var remove = repeated

@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
@@ -56,6 +57,17 @@ internal object GroqAsrClient {
         "ko" to "한국어",
         "kk" to "Қазақша",
         "uz" to "Oʻzbekcha"
+    )
+
+    val QUICK_LANGUAGE_PILLS = listOf(
+        "auto" to "Авто",
+        "multi" to "RU + EN",
+        "ru" to "RU",
+        "en" to "EN",
+        "es" to "ES",
+        "de" to "DE",
+        "fr" to "FR",
+        "uk" to "UK"
     )
 
     /**
@@ -106,7 +118,14 @@ internal object GroqAsrClient {
     @Serializable
     private data class GroqWord(val word: String, val start: Float, val end: Float)
     @Serializable
-    private data class GroqSegment(val text: String, val start: Float, val end: Float)
+    private data class GroqSegment(
+        val text: String,
+        val start: Float,
+        val end: Float,
+        @SerialName("avg_logprob") val avgLogprob: Float? = null,
+        @SerialName("no_speech_prob") val noSpeechProb: Float? = null,
+        @SerialName("compression_ratio") val compressionRatio: Float? = null
+    )
     @Serializable
     private data class GroqTranscript(
         val language: String = "",
@@ -235,22 +254,43 @@ internal object GroqAsrClient {
         }
         val wordsByTime = parsed.words.mapNotNull { word ->
             val text = word.word.trim()
+            if (text.isEmpty() || word.end < word.start) return@mapNotNull null
             val start = word.start.coerceIn(0f, duration)
             val end = word.end.coerceIn(start, duration)
-            if (text.isEmpty() || end <= start) null else TranscriptWord(text, start, end)
+            TranscriptWord(text, start, end)
         }.sortedBy { it.start }
         val segments = parsed.segments.orEmpty().ifEmpty {
             listOf(GroqSegment(parsed.text.orEmpty(), 0f, duration))
         }
-        val result = segments.mapNotNull { segment ->
+        val result = segments.mapIndexedNotNull { idx, segment ->
             val start = segment.start.coerceIn(0f, duration)
             val end = segment.end.coerceIn(start, duration)
             val text = segment.text.trim()
-            if (text.isEmpty() || end <= start) return@mapNotNull null
-            val words = wordsByTime.filter { (it.start + it.end) / 2f in start..<end }
+            if (text.isEmpty() || end <= start) return@mapIndexedNotNull null
+            if (isLikelyHallucination(text, segment)) return@mapIndexedNotNull null
+            val isLastSegment = idx == segments.lastIndex
+            val words = wordsByTime.filter { w ->
+                val mid = (w.start + w.end) / 2f
+                if (isLastSegment) mid in start..end else mid in start..<end
+            }
             SpeechSegment(start, end, text, words.ifEmpty { estimateWords(text, start, end) })
         }.sortedBy { it.startSec }
         return Transcript(normalizeLanguage(parsed.language), result)
+    }
+
+    private fun isLikelyHallucination(text: String, segment: GroqSegment): Boolean {
+        if (text.none { it.isLetterOrDigit() }) return true
+        val noSpeech = segment.noSpeechProb
+        val avgLogprob = segment.avgLogprob
+        val compressionRatio = segment.compressionRatio
+        if (compressionRatio != null && compressionRatio >= 2.8f) return true
+        if (noSpeech != null && noSpeech >= 0.90f && (avgLogprob == null || avgLogprob <= -0.65f || text.length <= 48)) {
+            return true
+        }
+        if (noSpeech != null && avgLogprob != null && noSpeech >= 0.72f && avgLogprob <= -1.15f) {
+            return true
+        }
+        return false
     }
 
     private suspend fun transcribeRequest(request: Request): String {
@@ -305,19 +345,41 @@ internal object GroqAsrClient {
         })
     }
 
-    private fun hasSignal(pcm: ByteArray): Boolean {
-        // Require multiple samples above low room noise floor to skip dead silence without dropping quiet distant speech.
-        var aboveFloor = 0
-        for (i in 0 until pcm.size - 1 step 2) {
-            val sample = ((pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xff)).toShort().toInt()
-            if (kotlin.math.abs(sample) > 40 && ++aboveFloor >= 48) return true
+    internal fun hasSignal(pcm: ByteArray): Boolean {
+        // Check sliding 20 ms (320-sample) frames for real peak + sustained RMS energy so
+        // electrical clicks / dead silence are skipped without dropping soft distant speech.
+        val sampleCount = pcm.size / 2
+        if (sampleCount < 48) return false
+        val frameSamples = 320
+        var idx = 0
+        while (idx + 1 < pcm.size) {
+            var sumSq = 0.0
+            var peakAbs = 0
+            var activeSamples = 0
+            var count = 0
+            val frameEnd = minOf(pcm.size - 1, idx + frameSamples * 2)
+            while (idx < frameEnd) {
+                val sample = ((pcm[idx + 1].toInt() shl 8) or (pcm[idx].toInt() and 0xff)).toShort().toInt()
+                val absSample = kotlin.math.abs(sample)
+                if (absSample > peakAbs) peakAbs = absSample
+                if (absSample >= 64) activeSamples++
+                sumSq += sample.toDouble() * sample.toDouble()
+                count++
+                idx += 2
+            }
+            if (count >= 48) {
+                val frameRms = kotlin.math.sqrt(sumSq / count)
+                if (peakAbs >= 96 && frameRms >= 24.0 && activeSamples >= 12) return true
+            }
         }
         return false
     }
 
     private fun estimateWords(text: String, start: Float, end: Float): List<TranscriptWord> {
-        val tokens = text.split(Regex("\\s+"))
-        val span = (end - start) / tokens.sumOf { it.length }
+        val tokens = text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (tokens.isEmpty()) return emptyList()
+        val totalChars = tokens.sumOf { it.length }.coerceAtLeast(1)
+        val span = (end - start) / totalChars
         var cursor = start
         return tokens.map { token ->
             val next = (cursor + span * token.length).coerceAtMost(end)

@@ -20,6 +20,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.Process
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import com.stenograf.app.MainActivity
 import com.stenograf.app.R
@@ -27,6 +28,8 @@ import com.stenograf.app.StenografApp
 import com.stenograf.app.asr.AsrEvent
 import com.stenograf.app.asr.AsrJsonParser
 import com.stenograf.app.asr.AsrTextFormatter
+import com.stenograf.app.asr.GigaAmV4Native
+import com.stenograf.app.asr.GigaAmV4OnlineLease
 import com.stenograf.app.asr.GroqAsrClient
 import com.stenograf.app.asr.LocalSpeakerLabeler
 import com.stenograf.app.asr.SpeakerAttributionSession
@@ -37,7 +40,10 @@ import com.stenograf.app.asr.TinyAsrCatalog
 import com.stenograf.app.asr.TranscriptReviewModel
 import com.stenograf.app.asr.TinyAsrNative
 import com.stenograf.app.asr.TranscriptWord
+import com.stenograf.app.asr.mergeDetectedLanguages
 import com.stenograf.app.audio.M4aAudioWriter
+import com.stenograf.app.audio.NeuralSpeechEnhancer
+import com.stenograf.app.audio.AlignedCaptureFilter
 import com.stenograf.app.audio.SpeechNormalizer
 import com.stenograf.app.audio.StreamingResamplerTo16k
 import com.stenograf.app.audio.WavHelper
@@ -79,10 +85,12 @@ import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.sqrt
 
 data class LiveRecordingUiState(
     val isActive: Boolean = false,
+    val isStarting: Boolean = false,
     val isPaused: Boolean = false,
     val isFinishing: Boolean = false,
     val isEngineProcessing: Boolean = false,
@@ -142,17 +150,18 @@ class RecordingForegroundService : Service() {
     private val spoolLock = Object()
     private val totalSpoolBytes = AtomicLong(0L)
     private val processedSpoolBytes = AtomicLong(0L)
-    private val localDecodedSpoolBytes = AtomicLong(0L)
     private val captureClosedFlag = AtomicBoolean(false)
+    private val originalCaptureFailed = AtomicBoolean(false)
+    private val capturedAudio = AtomicBoolean(false)
+    private val spoolCaptureFailed = AtomicBoolean(false)
+    private val asrCommitLock = Mutex()
+    private val asrWritableRecordingId = AtomicLong(0L)
 
     @Volatile
     private var currentRecording: RecordingEntity? = null
-    @Volatile
-    private var requestedPresetSwitch: String? = null
-    @Volatile
-    private var activeThreadCount: Int = 2
-
-    private var captureThread: Thread? = null
+    private data class PresetSwitch(val recordingId: Long, val presetId: String, val audioByte: Long)
+    private val requestedPresetSwitch = AtomicReference<PresetSwitch?>(null)
+    private val observedLiveLang = AtomicReference<String?>(null)
 
     private val waveformHistory = ArrayDeque<Float>(72)
     @Volatile
@@ -162,7 +171,6 @@ class RecordingForegroundService : Service() {
     private val committedList = mutableListOf<ParagraphEntity>()
     private var currentParagraphEntityId: Long = 0L
     private var nextOrderIndex: Int = 0
-    private var timeOffsetSec: Float = 0f
 
     companion object {
         const val CHANNEL_ID = "stenograf_recording_channel"
@@ -217,15 +225,22 @@ class RecordingForegroundService : Service() {
                     val folderId = if (intent.hasExtra(EXTRA_FOLDER_ID)) {
                         intent.getLongExtra(EXTRA_FOLDER_ID, -1L).takeIf { it > 0L }
                     } else null
-                    startForegroundCompat(AppLocaleManager.currentStrings().preparingModel, isPaused = false)
+                    val strings = AppLocaleManager.currentStrings()
+                    _uiState.value = LiveRecordingUiState(isStarting = true)
+                    try {
+                        startForegroundCompat(strings.preparingModel, isPaused = false)
+                    } catch (failure: Exception) {
+                        sessionStarting.set(false)
+                        reportStartFailure(failure)
+                        return START_NOT_STICKY
+                    }
                     serviceScope.launch {
                         try {
                             beginRecordingSession(folderId)
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            _uiState.value = LiveRecordingUiState(asrError = e.message)
-                            stopSelf()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (failure: Exception) {
+                            reportStartFailure(failure)
                         } finally {
                             sessionStarting.set(false)
                         }
@@ -238,6 +253,12 @@ class RecordingForegroundService : Service() {
             ACTION_STOP -> stopRecording()
         }
         return START_NOT_STICKY
+    }
+
+    private fun reportStartFailure(failure: Exception) {
+        android.util.Log.w("Vanta", "Could not start microphone recording", failure)
+        _uiState.value = LiveRecordingUiState(asrError = AppLocaleManager.currentStrings().micAccessFailed)
+        stopSelf()
     }
 
     private fun startForegroundCompat(statusText: String, isPaused: Boolean) {
@@ -258,7 +279,7 @@ class RecordingForegroundService : Service() {
         app.recordingRecovery.join()
         val settings = app.preferences.settingsFlow.first()
         if (stopRequested.get()) {
-            _uiState.value = LiveRecordingUiState()
+            _uiState.value = LiveRecordingUiState(asrError = strings.audioFileNotFound)
             stopSelf()
             return
         }
@@ -273,7 +294,7 @@ class RecordingForegroundService : Service() {
             return
         }
 
-        val useGroqLive = settings.asrEngineMode == AsrEngineMode.GROQ_API
+        val useGroqLive = settings.asrEngineMode == AsrEngineMode.GROQ_API && settings.groqApiKey.isNotBlank()
         val initialLang = if (useGroqLive) {
             settings.groqLanguageMode.takeUnless { it == "multi" || it == "auto" } ?: ""
         } else {
@@ -290,12 +311,17 @@ class RecordingForegroundService : Service() {
         currentRecording = rec
         totalSpoolBytes.set(0L)
         processedSpoolBytes.set(0L)
-        localDecodedSpoolBytes.set(0L)
+        val localDecodedSpoolBytes = AtomicLong()
         captureClosedFlag.set(false)
+        originalCaptureFailed.set(false)
+        capturedAudio.set(false)
+        spoolCaptureFailed.set(false)
         isPausedFlag.set(false)
         pausedByAudioFocus.set(false)
         isRecordingFlag.set(true)
-        requestedPresetSwitch = null
+        requestedPresetSwitch.set(null)
+        observedLiveLang.set(null)
+        asrWritableRecordingId.set(rec.id)
 
         waveformHistory.clear()
         repeat(72) { waveformHistory.addLast(0f) }
@@ -304,7 +330,6 @@ class RecordingForegroundService : Service() {
         localParagraphBreaks.clear()
         currentParagraphEntityId = 0L
         nextOrderIndex = 0
-        timeOffsetSec = 0f
 
         _uiState.value = LiveRecordingUiState(
             isActive = true,
@@ -327,15 +352,24 @@ class RecordingForegroundService : Service() {
             finishedRecordingId = null
         )
 
-        acquireWakeLock()
-        requestAudioFocus()
-        updateNotification(strings.notifRecordingActive, isPaused = false)
+        runCatching { acquireWakeLock() }
+        runCatching { requestAudioFocus() }
+        if (!stopRequested.get()) runCatching { updateNotification(strings.notifRecordingActive, isPaused = false) }
 
         val captureFinished = CompletableDeferred<Unit>()
-        captureThread = Thread({
+        Thread({
             try {
-                runCaptureLoop(rec, settings.audioFormat, settings.useRawMicrophone, settings.distantSpeechBoost)
+                runCaptureLoop(
+                    rec = rec,
+                    audioFormat = settings.audioFormat,
+                    useRawMic = settings.useRawMicrophone,
+                    distantSpeechBoost = settings.distantSpeechBoost,
+                    neuralNoiseSuppression = settings.neuralNoiseSuppression,
+                    fastEnhancer = settings.fastEnhancer,
+                    localDecodedSpoolBytes = localDecodedSpoolBytes
+                )
             } catch (e: Exception) {
+                originalCaptureFailed.set(true)
                 _uiState.update { it.copy(asrError = e.message) }
             } finally {
                 captureClosedFlag.set(true)
@@ -344,32 +378,60 @@ class RecordingForegroundService : Service() {
             }
         }, "Stenograf-AudioCapture").apply { start() }
 
-        if (useGroqLive) {
-            val commitLock = Mutex()
-            val cloudUnavailable = AtomicBoolean(false)
-            val cloud = serviceScope.launch(Dispatchers.IO) {
+        val cloudUnavailable = AtomicBoolean(false)
+        val localFinished = CompletableDeferred<Unit>()
+        val cloud = if (useGroqLive) {
+            serviceScope.launch(Dispatchers.IO) {
                 runGroqLiveLoop(
-                    rec, settings.groqModelId, settings.speakerDiarization,
-                    commitLock, cloudUnavailable
+                    rec = rec,
+                    modelId = settings.groqModelId,
+                    speakerDiarization = settings.speakerDiarization,
+                    autoLearnSpeakers = settings.autoLearnSpeakers,
+                    cloudUnavailable = cloudUnavailable
                 )
-            }
-            app.applicationScope.launch(Dispatchers.IO) {
-                captureFinished.await()
-                try {
-                    if (!cloudUnavailable.get()) withTimeoutOrNull(5_000L) { cloud.join() }
-                } finally {
-                    cloud.cancel()
-                    // An already-started DB batch may complete. Network and speaker work
-                    // hold no lock and cannot delay finalization.
-                    withContext(NonCancellable) {
-                        commitLock.withLock { finalizeRecordingInDatabase(rec) }
-                    }
-                }
             }
         } else {
             Thread({
-                runAsrLoop(rec, preset.id, settings.asrThreads, settings.asrBeam, settings.speakerDiarization)
+                try {
+                    runAsrLoop(
+                        rec = rec,
+                        initialPresetId = preset.id,
+                        requestedThreads = settings.asrThreads,
+                        beam = settings.asrBeam,
+                        speakerDiarization = settings.speakerDiarization,
+                        autoLearnSpeakers = settings.autoLearnSpeakers,
+                        localDecodedSpoolBytes = localDecodedSpoolBytes
+                    )
+                } finally {
+                    localFinished.complete(Unit)
+                }
             }, "Stenograf-TinyASR").start()
+            null
+        }
+        app.applicationScope.launch(Dispatchers.IO) {
+            captureFinished.await()
+            try {
+                if (cloud == null) {
+                    withTimeoutOrNull(1_500L) { localFinished.await() }
+                } else if (!cloudUnavailable.get()) {
+                    withTimeoutOrNull(2_500L) { cloud.join() }
+                }
+            } finally {
+                cloud?.cancel()
+                withContext(NonCancellable) {
+                    asrCommitLock.withLock { asrWritableRecordingId.set(0L) }
+                    synchronized(spoolLock) { spoolLock.notifyAll() }
+                    finalizeRecordingInDatabase(rec)
+                }
+            }
+        }
+    }
+
+    private fun isAsrOpen(recordingId: Long): Boolean = asrWritableRecordingId.get() == recordingId
+
+    private fun updateAsrUi(recordingId: Long, update: (LiveRecordingUiState) -> LiveRecordingUiState) {
+        _uiState.update { state ->
+            if (isAsrOpen(recordingId) && state.recordingId == recordingId) update(state) else state
         }
     }
 
@@ -378,7 +440,10 @@ class RecordingForegroundService : Service() {
         rec: RecordingEntity,
         audioFormat: AudioFormat,
         useRawMic: Boolean,
-        distantSpeechBoost: Boolean
+        distantSpeechBoost: Boolean,
+        neuralNoiseSuppression: Boolean,
+        fastEnhancer: Boolean,
+        localDecodedSpoolBytes: AtomicLong
     ) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
         if (stopRequested.get()) return
@@ -390,6 +455,7 @@ class RecordingForegroundService : Service() {
 
         val (initialRecord, actualRate) = openAudioRecord(desiredRate, useRawMic)
         if (initialRecord == null) {
+            originalCaptureFailed.set(true)
             val s = AppLocaleManager.currentStrings()
             _uiState.update { state ->
                 state.copy(
@@ -413,10 +479,25 @@ class RecordingForegroundService : Service() {
 
         var audioDataBytes = 0L
         var capturedSamples = 0L
-        var lastHeaderSyncMs = System.currentTimeMillis()
+        var lastHeaderSyncMs = SystemClock.elapsedRealtime()
         var lastDbProgressMs = lastHeaderSyncMs
         var lastStorageCheckMs = lastHeaderSyncMs
         var zeroReadCount = 0
+        val neuralEnhancer = if (neuralNoiseSuppression) NeuralSpeechEnhancer.tryCreate(assets, preferFast = fastEnhancer) else null
+        val captureFilter = neuralEnhancer?.let { enhancer ->
+            AlignedCaptureFilter(enhancer::processShorts, enhancer::flushShorts, enhancer::reset) { failure ->
+                android.util.Log.w("Vanta", "Live speech filter failed; using unfiltered audio", failure)
+            }
+        }
+
+        fun reportSpoolFailure(failure: Throwable) {
+            spoolCaptureFailed.set(true)
+            android.util.Log.w("Vanta", "Live transcription spool stopped; original capture continues", failure)
+            val message = if (AppLocaleManager.currentLanguage.value.code == "ru") {
+                "Живой текст приостановлен. Запись аудио продолжается."
+            } else "Live transcription paused. Audio recording continues."
+            _uiState.update { it.copy(asrError = message) }
+        }
 
         try {
             if (isWav) {
@@ -425,19 +506,54 @@ class RecordingForegroundService : Service() {
             } else {
                 m4aWriter = M4aAudioWriter(audioFile, actualRate, 128_000)
             }
-            spoolOut = BufferedOutputStream(FileOutputStream(spoolFile), 64 * 1024)
+            spoolOut = try {
+                BufferedOutputStream(FileOutputStream(spoolFile), 64 * 1024)
+            } catch (failure: Exception) {
+                reportSpoolFailure(failure)
+                null
+            }
 
             val frameSamples = (actualRate * 40) / 1000 // 40ms frame
             val readBuf = ShortArray(frameSamples)
             val byteBuf = ByteArray(frameSamples * 2)
-            var asrScratch = ShortArray(frameSamples)
             val asrNormalizer = if (distantSpeechBoost) SpeechNormalizer(sampleRate = 16_000) else null
             var spoolWriteBuf = ByteArray(4096)
+            var wasPaused = false
+
+            fun writeSpoolSamples(samples: ShortArray, count: Int) {
+                if (count <= 0) return
+                val outStream = spoolOut ?: return
+                try {
+                    asrNormalizer?.processInPlace(samples, count)
+                    val bytesNeeded = count * 2
+                    if (bytesNeeded > spoolWriteBuf.size) {
+                        spoolWriteBuf = ByteArray(bytesNeeded)
+                    }
+                    ByteBuffer.wrap(spoolWriteBuf, 0, bytesNeeded)
+                        .order(ByteOrder.LITTLE_ENDIAN)
+                        .asShortBuffer()
+                        .put(samples, 0, count)
+                    outStream.write(spoolWriteBuf, 0, bytesNeeded)
+                    outStream.flush()
+                    totalSpoolBytes.addAndGet(bytesNeeded.toLong())
+                    synchronized(spoolLock) {
+                        spoolLock.notifyAll()
+                    }
+                } catch (failure: Exception) {
+                    spoolOut = null
+                    runCatching { outStream.close() }
+                    reportSpoolFailure(failure)
+                }
+            }
 
             record.startRecording()
 
             while (!stopRequested.get()) {
                 if (isPausedFlag.get()) {
+                    if (!wasPaused) {
+                        captureFilter?.drain()?.let { writeSpoolSamples(it, it.size) }
+                    }
+                    wasPaused = true
                     if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
                         runCatching { record.stop() }
                         synchronized(waveformHistory) {
@@ -447,22 +563,29 @@ class RecordingForegroundService : Service() {
                     }
                     Thread.sleep(60L)
                     continue
-                } else if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                    runCatching { record.startRecording() }
+                } else {
+                    if (wasPaused) {
+                        captureFilter?.restart()
+                        asrNormalizer?.reset()
+                        wasPaused = false
+                    }
                     if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                        runCatching { record.release() }
-                        val (reopened, _) = openAudioRecord(actualRate, useRawMic)
-                        if (reopened != null) {
-                            record = reopened
-                            runCatching { record.startRecording() }
-                        }
+                        runCatching { record.startRecording() }
                         if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                            pauseRecording(
-                                byAudioFocus = false,
-                                notice = AppLocaleManager.currentStrings().micLostNotice
-                            )
-                            Thread.sleep(80L)
-                            continue
+                            runCatching { record.release() }
+                            val (reopened, _) = openAudioRecord(actualRate, useRawMic, allowFallbackRates = false)
+                            if (reopened != null) {
+                                record = reopened
+                                runCatching { record.startRecording() }
+                            }
+                            if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                                pauseRecording(
+                                    byAudioFocus = false,
+                                    notice = AppLocaleManager.currentStrings().micLostNotice
+                                )
+                                Thread.sleep(80L)
+                                continue
+                            }
                         }
                     }
                 }
@@ -512,35 +635,23 @@ class RecordingForegroundService : Service() {
                     m4aWriter!!.writePcm16(readBuf, read)
                 }
 
-                // 3. Write 16kHz PCM16 spool for TinyASR (adaptive AGC for distant speech when enabled)
-                var pcm16k = if (actualRate == 16_000) readBuf else resampler.process(readBuf, read)
-                val pcm16kCount = if (actualRate == 16_000) read else pcm16k.size
-                if (pcm16kCount > 0) {
-                    if (asrNormalizer != null) {
-                        if (pcm16k === readBuf) {
-                            if (asrScratch.size < pcm16kCount) asrScratch = ShortArray(pcm16kCount)
-                            System.arraycopy(readBuf, 0, asrScratch, 0, pcm16kCount)
-                            pcm16k = asrScratch
+                capturedSamples += read
+                capturedAudio.set(true)
+                if (!spoolCaptureFailed.get()) {
+                    val pcm = if (actualRate == 16_000) readBuf else resampler.process(readBuf, read)
+                    val count = if (actualRate == 16_000) read else pcm.size
+                    if (count > 0) {
+                        val enhanced = captureFilter?.push(pcm, count)
+                        if (enhanced != null) {
+                            writeSpoolSamples(enhanced, enhanced.size)
+                        } else if (asrNormalizer != null && pcm === readBuf) {
+                            writeSpoolSamples(pcm.copyOf(count), count)
+                        } else {
+                            writeSpoolSamples(pcm, count)
                         }
-                        asrNormalizer.processInPlace(pcm16k, pcm16kCount)
-                    }
-                    val bytesNeeded = pcm16kCount * 2
-                    if (bytesNeeded > spoolWriteBuf.size) {
-                        spoolWriteBuf = ByteArray(bytesNeeded)
-                    }
-                    ByteBuffer.wrap(spoolWriteBuf, 0, bytesNeeded)
-                        .order(ByteOrder.LITTLE_ENDIAN)
-                        .asShortBuffer()
-                        .put(pcm16k, 0, pcm16kCount)
-                    spoolOut.write(spoolWriteBuf, 0, bytesNeeded)
-                    spoolOut.flush()
-                    totalSpoolBytes.addAndGet(bytesNeeded.toLong())
-                    synchronized(spoolLock) {
-                        spoolLock.notifyAll()
                     }
                 }
 
-                capturedSamples += read
                 val durationMs = (capturedSamples * 1000L) / actualRate
                 val wfCopy = synchronized(waveformHistory) { waveformHistory.toList() }
                 _uiState.update { state ->
@@ -552,7 +663,7 @@ class RecordingForegroundService : Service() {
                     )
                 }
 
-                val nowMs = System.currentTimeMillis()
+                val nowMs = SystemClock.elapsedRealtime()
                 if (isWav && nowMs - lastHeaderSyncMs >= 5_000L) {
                     lastHeaderSyncMs = nowMs
                     wavOut?.flush()
@@ -576,12 +687,12 @@ class RecordingForegroundService : Service() {
                             detectedLang = lang
                         )
                     }
-                    val sNotif = AppLocaleManager.currentStrings()
-                    updateNotification(
-                        if (isPausedFlag.get()) "${sNotif.recordingPaused} · ${AsrTextFormatter.formatDurationMs(durSnapshot)}"
-                        else "${sNotif.notifRecordingActive} · ${AsrTextFormatter.formatDurationMs(durSnapshot)}",
-                        isPaused = isPausedFlag.get()
-                    )
+                    if (!stopRequested.get()) {
+                        val sNotif = AppLocaleManager.currentStrings()
+                        val paused = isPausedFlag.get()
+                        val label = if (paused) sNotif.recordingPaused else sNotif.notifRecordingActive
+                        updateNotification("$label · ${AsrTextFormatter.formatDurationMs(durSnapshot)}", isPaused = paused)
+                    }
                 }
 
                 if (nowMs - lastStorageCheckMs >= 10_000L) {
@@ -607,36 +718,33 @@ class RecordingForegroundService : Service() {
                     }
                 }
             }
+            captureFilter?.drain()?.let { writeSpoolSamples(it, it.size) }
         } catch (t: Throwable) {
+            originalCaptureFailed.set(true)
             _uiState.update { state ->
                 state.copy(
                     asrError = "${AppLocaleManager.currentStrings().audioWriteError}: ${t.message}"
                 )
             }
         } finally {
+            runCatching { neuralEnhancer?.close() }
             runCatching {
-                if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                    record.stop()
-                }
-                record.release()
+                if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) record.stop()
             }
+            runCatching { record.release() }
+            runCatching { wavOut?.close() }.onFailure { originalCaptureFailed.set(true) }
             runCatching {
-                wavOut?.flush()
-                wavOut?.close()
-                if (isWav && audioDataBytes > 0L) {
-                    WavHelper.updateHeaderSizes(audioFile, audioDataBytes)
-                }
-            }
-            runCatching { m4aWriter?.close() }
-            runCatching {
-                spoolOut?.flush()
-                spoolOut?.close()
-            }
+                if (isWav && audioDataBytes > 0L) WavHelper.updateHeaderSizes(audioFile, audioDataBytes)
+            }.onFailure { originalCaptureFailed.set(true) }
+            runCatching { m4aWriter?.close() }.onFailure { originalCaptureFailed.set(true) }
+            runCatching { spoolOut?.close() }.onFailure(::reportSpoolFailure)
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun openAudioRecord(desiredRate: Int, useRawMic: Boolean): Pair<AudioRecord?, Int> {
+    private fun openAudioRecord(
+        desiredRate: Int, useRawMic: Boolean, allowFallbackRates: Boolean = true
+    ): Pair<AudioRecord?, Int> {
         val sources = if (useRawMic) {
             listOf(
                 MediaRecorder.AudioSource.UNPROCESSED,
@@ -649,7 +757,8 @@ class RecordingForegroundService : Service() {
                 MediaRecorder.AudioSource.MIC
             )
         }
-        val rates = listOf(desiredRate, 16_000, 48_000, 44_100).distinct()
+        val rates = if (allowFallbackRates) listOf(desiredRate, 16_000, 48_000, 44_100).distinct()
+            else listOf(desiredRate)
 
         for (source in sources) {
             for (rate in rates) {
@@ -678,49 +787,142 @@ class RecordingForegroundService : Service() {
         return null to desiredRate
     }
 
+    private fun createSpeakerSession(
+        autoLearnSpeakers: Boolean,
+        onUnavailable: () -> Unit
+    ): SpeakerAttributionSession {
+        val stored = runCatching { runBlocking { app.repository.getAllStoredVoiceprints() } }.getOrDefault(emptyList())
+        return SpeakerAttributionSession(
+            assets = assets,
+            label = speakerLabel(),
+            autoVoicePrefix = autoVoicePrefix(),
+            autoLearnSpeakers = autoLearnSpeakers,
+            storedProfiles = stored,
+            onPersistUpdates = { updates ->
+                runBlocking {
+                    app.repository.persistLearnedVoiceprints(updates)
+                }
+            },
+            onUnavailable = onUnavailable
+        )
+    }
+
+    private sealed interface LiveAsrLease {
+        val modelId: String
+
+        data class Tiny(val lease: ModelLease) : LiveAsrLease {
+            override val modelId: String get() = lease.modelId
+        }
+
+        data class GigaV4(val lease: GigaAmV4OnlineLease) : LiveAsrLease {
+            override val modelId: String get() = lease.modelId
+        }
+    }
+
+    private sealed interface LiveAsrSession {
+        val handle: Long
+
+        data class Tiny(override val handle: Long) : LiveAsrSession
+        data class GigaV4(override val handle: Long) : LiveAsrSession
+    }
+
+    private suspend fun acquireLiveLease(preset: com.stenograf.app.asr.LanguagePreset, threads: Int): LiveAsrLease =
+        if (preset.modelId == TinyAsrCatalog.GIGAAM_V4) {
+            LiveAsrLease.GigaV4(app.modelManager.acquireGigaV4OnlineLease(threads.coerceIn(1, 4)))
+        } else {
+            LiveAsrLease.Tiny(app.modelManager.acquireModelLease(preset.modelId, threads))
+        }
+
+    private suspend fun releaseLiveLease(lease: LiveAsrLease?) {
+        when (lease) {
+            is LiveAsrLease.Tiny -> app.modelManager.releaseModelLease(lease.lease)
+            is LiveAsrLease.GigaV4 -> app.modelManager.releaseGigaV4OnlineLease(lease.lease)
+            null -> Unit
+        }
+    }
+
+    private fun createLiveSession(
+        lease: LiveAsrLease,
+        preset: com.stenograf.app.asr.LanguagePreset,
+        beam: Int
+    ): LiveAsrSession? = when (lease) {
+        is LiveAsrLease.Tiny -> TinyAsrNative.nativeSessionCreate(
+            lease.lease.handle,
+            preset.langsCsv,
+            preset.startLang,
+            beam
+        ).takeIf { it != 0L }?.let(LiveAsrSession::Tiny)
+        is LiveAsrLease.GigaV4 -> GigaAmV4Native.nativeStreamCreate(lease.lease.handle)
+            .takeIf { it != 0L }
+            ?.let(LiveAsrSession::GigaV4)
+    }
+
+    private fun pushLivePcm16(session: LiveAsrSession, pcm: ShortArray, samplesCount: Int): String? = when (session) {
+        is LiveAsrSession.Tiny -> TinyAsrNative.nativeSessionPushPcm16(session.handle, pcm, 0, samplesCount)
+        is LiveAsrSession.GigaV4 -> GigaAmV4Native.nativeStreamPushPcm16(session.handle, pcm, 0, samplesCount)
+    }
+
+    private fun finishLiveSession(session: LiveAsrSession): String? = when (session) {
+        is LiveAsrSession.Tiny -> TinyAsrNative.nativeSessionFinish(session.handle)
+        is LiveAsrSession.GigaV4 -> GigaAmV4Native.nativeStreamFinish(session.handle)
+    }
+
+    private fun freeLiveSession(session: LiveAsrSession?) {
+        when (session) {
+            is LiveAsrSession.Tiny -> if (session.handle != 0L) TinyAsrNative.nativeSessionFree(session.handle)
+            is LiveAsrSession.GigaV4 -> if (session.handle != 0L) GigaAmV4Native.nativeStreamFree(session.handle)
+            null -> Unit
+        }
+    }
+
     private fun runAsrLoop(
         rec: RecordingEntity,
         initialPresetId: String,
         requestedThreads: Int,
         beam: Int,
-        speakerDiarization: Boolean
+        speakerDiarization: Boolean,
+        autoLearnSpeakers: Boolean,
+        localDecodedSpoolBytes: AtomicLong
     ) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT + 2)
-        val threads = if (requestedThreads > 0) requestedThreads else 2
-        activeThreadCount = threads
+        val threads = if (requestedThreads > 0) requestedThreads else
+            TinyAsrNative.nativePinToBigCores().coerceIn(2, 4)
 
         var activePreset = TinyAsrCatalog.findPreset(initialPresetId)
-        var modelLease: ModelLease? = null
-        var sessionHandle = 0L
+        var timeOffsetSec = 0f
+        var modelLease: LiveAsrLease? = null
+        var liveSession: LiveAsrSession? = null
         var raf: RandomAccessFile? = null
         val speakerSession = if (speakerDiarization) {
-            SpeakerAttributionSession(assets, speakerLabel()) {
-                _uiState.update { it.copy(asrError = AppLocaleManager.currentStrings().speakerDiarizationUnavailable) }
+            createSpeakerSession(autoLearnSpeakers) {
+                updateAsrUi(rec.id) { it.copy(asrError = AppLocaleManager.currentStrings().speakerDiarizationUnavailable) }
             }
         } else null
 
         fun statusLabelFor(preset: com.stenograf.app.asr.LanguagePreset): String {
             val sNow = AppLocaleManager.currentStrings()
-            return "${sNow.recordingLocalStatus} · ${preset.modelId.uppercase()} · $threads ${sNow.threadsWord}"
+            val modelLabel = if (preset.modelId == TinyAsrCatalog.GIGAAM_V4) "GigaAM v4" else preset.modelId.uppercase()
+            return "${sNow.recordingLocalStatus} · $modelLabel · $threads ${sNow.threadsWord}"
+        }
+
+        fun commitSpeech(words: List<TranscriptWord>, speaker: String?) {
+            if (!isAsrOpen(rec.id)) return
+            runBlocking {
+                asrCommitLock.withLock {
+                    if (isAsrOpen(rec.id)) commitLocalSpeech(rec.id, words, speaker, localDecodedSpoolBytes.get())
+                }
+            }
         }
 
         try {
             val initStrings = AppLocaleManager.currentStrings()
-            val initialLease = runBlocking {
-                app.modelManager.acquireModelLease(activePreset.modelId, threads)
-            }
+            val initialLease = runBlocking { acquireLiveLease(activePreset, threads) }
             modelLease = initialLease
-            sessionHandle = TinyAsrNative.nativeSessionCreate(
-                initialLease.handle,
-                activePreset.langsCsv,
-                activePreset.startLang,
-                beam
-            )
-            if (sessionHandle == 0L) {
-                throw IllegalStateException(initStrings.asrSessionError)
-            }
+            if (!isAsrOpen(rec.id)) return
+            liveSession = createLiveSession(initialLease, activePreset, beam)
+                ?: throw IllegalStateException(initStrings.asrSessionError)
 
-            _uiState.update { state ->
+            updateAsrUi(rec.id) { state ->
                 state.copy(
                     asrStatusText = statusLabelFor(activePreset),
                     activeLanguage = activePreset.startLang,
@@ -729,10 +931,10 @@ class RecordingForegroundService : Service() {
             }
 
             val spoolFile = File(rec.asrSpoolPath)
-            while (!spoolFile.exists() && !captureClosedFlag.get()) {
+            while (!spoolFile.exists() && !captureClosedFlag.get() && isAsrOpen(rec.id)) {
                 Thread.sleep(20L)
             }
-            if (!spoolFile.exists()) return
+            if (!spoolFile.exists() || !isAsrOpen(rec.id)) return
 
             val audio = RandomAccessFile(spoolFile, "r")
             raf = audio
@@ -741,19 +943,20 @@ class RecordingForegroundService : Service() {
                     audio.seek(start)
                     val pcm = ByteArray(count)
                     audio.readFully(pcm)
-                    session.analyze(pcm, start, destroyed::get)
+                    session.analyze(pcm, start) { destroyed.get() || !isAsrOpen(rec.id) }
                 }
             }
             val commitSpeech: (SpeechSegment) -> Unit = { speech ->
-                commitLocalSpeech(rec.id, speech.words, speech.speaker)
+                commitSpeech(speech.words, speech.speaker)
             }
             val enqueueSpeech: (List<TranscriptWord>) -> Unit = { words ->
-                if (labeler == null) commitLocalSpeech(rec.id, words, null) else labeler.offer(words)
+                if (labeler == null) commitSpeech(words, null) else labeler.offer(words)
             }
             fun publishSpeakers(finished: Boolean = false) {
+                if (!isAsrOpen(rec.id)) return
                 labeler?.drain(totalSpoolBytes.get(), finished, commitSpeech)
                 val draft = labeler?.draftWords().orEmpty()
-                _uiState.update { it.copy(pendingSpeakerWords = draft) }
+                updateAsrUi(rec.id) { it.copy(pendingSpeakerWords = draft) }
             }
 
             val chunkShorts = 640 * 4 // 160 ms
@@ -761,51 +964,73 @@ class RecordingForegroundService : Service() {
             val shortChunk = ShortArray(chunkShorts)
             var readCursor = 0L
 
-            while (true) {
-                // Handle runtime language preset switch
-                val switchPresetId = requestedPresetSwitch
-                if (switchPresetId != null) {
-                    requestedPresetSwitch = null
-                    val newPreset = TinyAsrCatalog.findPreset(switchPresetId)
+            while (isAsrOpen(rec.id)) {
+                val pendingSwitch = requestedPresetSwitch.get()?.takeIf {
+                    it.recordingId == rec.id && !stopRequested.get()
+                }
+                if (pendingSwitch != null && readCursor >= pendingSwitch.audioByte) {
+                    if (!requestedPresetSwitch.compareAndSet(pendingSwitch, null)) continue
+                    val newPreset = TinyAsrCatalog.findPreset(pendingSwitch.presetId)
                     if (newPreset.id != activePreset.id) {
-                        val finishJson = TinyAsrNative.nativeSessionFinish(sessionHandle)
-                        handleAsrEvents(finishJson, enqueueSpeech)
-                        publishSpeakers()
-                        TinyAsrNative.nativeSessionFree(sessionHandle)
-                        sessionHandle = 0L
-
                         val sNow = AppLocaleManager.currentStrings()
-                        if (newPreset.modelId != activePreset.modelId) {
-                            _uiState.update { it.copy(asrStatusText = "${sNow.switchingModel} (${newPreset.modelId.uppercase()})") }
-                            val newLease = runBlocking {
-                                app.modelManager.acquireModelLease(newPreset.modelId, threads)
+                        val oldLease = checkNotNull(modelLease)
+                        val oldSession = checkNotNull(liveSession)
+                        val newLease = if (newPreset.modelId == activePreset.modelId) oldLease else {
+                            val switchBadge = if (newPreset.modelId == TinyAsrCatalog.GIGAAM_V4) "GigaAM v4" else newPreset.modelId.uppercase()
+                            updateAsrUi(rec.id) { if (it.isFinishing) it else it.copy(asrStatusText = "${sNow.switchingModel} ($switchBadge)") }
+                            try {
+                                runBlocking { acquireLiveLease(newPreset, threads) }
+                            } catch (failure: Exception) {
+                                updateAsrUi(rec.id) { if (it.isFinishing) it else it.copy(asrStatusText = statusLabelFor(activePreset), asrError = failure.message ?: sNow.asrSessionError) }
+                                continue
                             }
-                            runBlocking { app.modelManager.releaseModelLease(modelLease) }
+                        }
+                        var replacementSession: LiveAsrSession? = null
+                        try {
+                            if (stopRequested.get() || !isAsrOpen(rec.id)) continue
+                            replacementSession = createLiveSession(newLease, newPreset, beam)
+                            if (replacementSession == null) {
+                                updateAsrUi(rec.id) { if (it.isFinishing) it else it.copy(asrStatusText = statusLabelFor(activePreset), asrError = sNow.asrSessionError) }
+                                continue
+                            }
+                            val finishJson = finishLiveSession(oldSession)
+                            if (!isAsrOpen(rec.id)) return
+                            handleAsrEvents(rec.id, finishJson, timeOffsetSec, enqueueSpeech)
+                            publishSpeakers()
+                            freeLiveSession(oldSession)
+                            liveSession = replacementSession
+                            replacementSession = null
                             modelLease = newLease
+                            if (newLease !== oldLease) runBlocking { releaseLiveLease(oldLease) }
+                        } finally {
+                            freeLiveSession(replacementSession)
+                            if (newLease !== modelLease) runBlocking { releaseLiveLease(newLease) }
                         }
                         activePreset = newPreset
-                        timeOffsetSec = (readCursor / 32_000f)
-                        localParagraphBreaks.add(LocalParagraphBreak(timeOffsetSec))
-                        sessionHandle = TinyAsrNative.nativeSessionCreate(
-                            modelLease!!.handle,
-                            activePreset.langsCsv,
-                            activePreset.startLang,
-                            beam
-                        )
-                        _uiState.update { state ->
+                        timeOffsetSec = readCursor / 32_000f
+                        runBlocking {
+                            asrCommitLock.withLock {
+                                if (isAsrOpen(rec.id)) localParagraphBreaks.add(LocalParagraphBreak(timeOffsetSec))
+                            }
+                        }
+                        updateAsrUi(rec.id) { state ->
                             state.copy(
                                 modelId = activePreset.modelId,
                                 languagePresetId = activePreset.id,
                                 activeLanguage = activePreset.startLang,
-                                asrStatusText = statusLabelFor(activePreset)
+                                asrStatusText = if (state.isFinishing) state.asrStatusText else statusLabelFor(activePreset),
+                                asrError = null
                             )
                         }
                     }
+                    continue
                 }
 
                 val available = totalSpoolBytes.get() - readCursor
-                if (available >= 1280L || (captureClosedFlag.get() && available >= 2L)) {
-                    val toReadBytes = minOf(available, byteChunk.size.toLong()).toInt() and 0x7FFFFFFE
+                val untilSwitch = pendingSwitch?.let { it.audioByte - readCursor } ?: Long.MAX_VALUE
+                if (available >= minOf(1280L, untilSwitch) ||
+                    (captureClosedFlag.get() && available >= 2L)) {
+                    val toReadBytes = minOf(available, untilSwitch, byteChunk.size.toLong()).toInt() and 0x7FFFFFFE
                     if (toReadBytes >= 2) {
                         raf.seek(readCursor)
                         val got = raf.read(byteChunk, 0, toReadBytes)
@@ -817,18 +1042,13 @@ class RecordingForegroundService : Service() {
                                 .get(shortChunk, 0, samplesCount)
                             readCursor += samplesCount * 2L
 
-                            val json = TinyAsrNative.nativeSessionPushPcm16(sessionHandle, shortChunk, 0, samplesCount)
+                            val json = pushLivePcm16(checkNotNull(liveSession), shortChunk, samplesCount)
+                            if (!isAsrOpen(rec.id)) return
                             localDecodedSpoolBytes.set(readCursor)
-                            handleAsrEvents(json, enqueueSpeech)
+                            handleAsrEvents(rec.id, json, timeOffsetSec, enqueueSpeech)
                             publishSpeakers()
-                            val committedBytes = if (labeler == null) readCursor else {
-                                val end = committedList.lastOrNull()?.endSec ?: 0f
-                                ((end * LocalSpeakerLabeler.PCM_BYTES_PER_SECOND).toLong() and -2L)
-                                    .coerceIn(0L, readCursor)
-                            }
-                            processedSpoolBytes.set(committedBytes)
                             val backlog = ((totalSpoolBytes.get() - readCursor).coerceAtLeast(0L)) / 32_000f
-                            _uiState.update { it.copy(backlogSeconds = backlog) }
+                            updateAsrUi(rec.id) { it.copy(backlogSeconds = backlog) }
                             continue
                         }
                     }
@@ -845,13 +1065,19 @@ class RecordingForegroundService : Service() {
                 }
             }
 
-            if (sessionHandle != 0L) {
-                val finishJson = TinyAsrNative.nativeSessionFinish(sessionHandle)
-                handleAsrEvents(finishJson, enqueueSpeech)
+            if (!isAsrOpen(rec.id)) return
+            liveSession?.let { activeSession ->
+                val finishJson = finishLiveSession(activeSession)
+                if (!isAsrOpen(rec.id)) return
+                handleAsrEvents(rec.id, finishJson, timeOffsetSec, enqueueSpeech)
             }
             publishSpeakers(finished = true)
-            processedSpoolBytes.set(readCursor)
-            _uiState.update { state ->
+            runBlocking {
+                asrCommitLock.withLock {
+                    if (isAsrOpen(rec.id)) processedSpoolBytes.set(readCursor)
+                }
+            }
+            updateAsrUi(rec.id) { state ->
                 state.copy(
                     openWords = emptyList(),
                     tailWords = emptyList(),
@@ -861,7 +1087,7 @@ class RecordingForegroundService : Service() {
             }
         } catch (t: Throwable) {
             val sErr = AppLocaleManager.currentStrings()
-            _uiState.update { state ->
+            updateAsrUi(rec.id) { state ->
                 state.copy(
                     asrError = t.message ?: sErr.asrSessionError,
                     asrStatusText = sErr.asrPausedSavingAudio,
@@ -871,12 +1097,9 @@ class RecordingForegroundService : Service() {
         } finally {
             runCatching { raf?.close() }
             runCatching { speakerSession?.close() }
-            if (sessionHandle != 0L) {
-                TinyAsrNative.nativeSessionFree(sessionHandle)
-            }
-            runBlocking { app.modelManager.releaseModelLease(modelLease) }
-            captureThread?.join()
-            runBlocking { finalizeRecordingInDatabase(rec) }
+            freeLiveSession(liveSession)
+            liveSession = null
+            runBlocking { releaseLiveLease(modelLease) }
         }
     }
 
@@ -884,13 +1107,13 @@ class RecordingForegroundService : Service() {
         rec: RecordingEntity,
         modelId: String,
         speakerDiarization: Boolean,
-        commitLock: Mutex,
+        autoLearnSpeakers: Boolean,
         cloudUnavailable: AtomicBoolean
     ) {
         val worker = currentCoroutineContext()
         var speakerWarning: String? = null
         val speakers = if (speakerDiarization) {
-            SpeakerAttributionSession(assets, speakerLabel()) {
+            createSpeakerSession(autoLearnSpeakers) {
                 speakerWarning = AppLocaleManager.currentStrings().speakerDiarizationUnavailable
             }
         } else null
@@ -906,7 +1129,7 @@ class RecordingForegroundService : Service() {
                     capturePaused = isPausedFlag::get,
                     stopRequested = stopRequested::get,
                     transcribe = { pcm ->
-                        _uiState.update { it.copy(isEngineProcessing = !it.isGroqRetrying) }
+                        updateAsrUi(rec.id) { it.copy(isEngineProcessing = !it.isGroqRetrying) }
                         val latestSettings = app.preferences.settingsFlow.first()
                         GroqAsrClient.transcribeChunk(
                             latestSettings.groqApiKey,
@@ -918,7 +1141,7 @@ class RecordingForegroundService : Service() {
                     },
                     onRetry = { error ->
                         cloudUnavailable.set(true)
-                        _uiState.update {
+                        updateAsrUi(rec.id) {
                             it.copy(
                                 asrError = GroqAsrClient.errorMessage(error),
                                 isGroqRetrying = true,
@@ -932,8 +1155,9 @@ class RecordingForegroundService : Service() {
                         speakers.analyze(pcm, offsetBytes) { !worker.isActive }.assign(parsed.segments)
                     } else parsed.segments
 
-                    commitLock.withLock {
+                    asrCommitLock.withLock {
                         worker.ensureActive()
+                        if (!isAsrOpen(rec.id)) return@withLock
                         val offset = offsetBytes.toFloat() / GroqAsrClient.PCM_BYTES_PER_SECOND
                         val batch = appendSpeechParagraphs(
                             committedList.lastOrNull(),
@@ -948,7 +1172,7 @@ class RecordingForegroundService : Service() {
                             nextOrderIndex += batch.newParagraphs.size
                             processedSpoolBytes.set(processed)
                             if (!destroyed.get()) {
-                                _uiState.update {
+                                updateAsrUi(rec.id) {
                                     it.copy(
                                         activeLanguage = parsed.language.ifBlank { it.activeLanguage },
                                         committedParagraphs = if (batch.updatedLast != null || batch.newParagraphs.isNotEmpty()) committedList.toList()
@@ -970,7 +1194,7 @@ class RecordingForegroundService : Service() {
             throw e
         } catch (e: Exception) {
             if (!destroyed.get() && worker.isActive) {
-                _uiState.update {
+                updateAsrUi(rec.id) {
                     it.copy(
                         asrError = if (e is IOException) GroqAsrClient.errorMessage(e) else e.message ?: "Groq недоступен.",
                         asrStatusText = AppLocaleManager.currentStrings().asrPausedSavingAudio,
@@ -984,25 +1208,30 @@ class RecordingForegroundService : Service() {
         }
     }
 
-    private fun commitLocalSpeech(recordingId: Long, words: List<TranscriptWord>, speaker: String?) {
+    private suspend fun commitLocalSpeech(recordingId: Long, words: List<TranscriptWord>, speaker: String?, decodedBytes: Long) {
         if (words.isEmpty()) return
         var cursor = 0
         while (cursor < words.size) {
             val mark = localParagraphBreaks.peek() ?: break
             val next = (cursor until words.size).firstOrNull { words[it].end >= mark.atSec } ?: break
-            if (next > cursor) commitWords(recordingId, words.subList(cursor, next), speaker)
+            if (next > cursor) commitWords(recordingId, words.subList(cursor, next), speaker, decodedBytes)
             localParagraphBreaks.poll()
             paragraphAccumulator.requestParagraphBreak(mark.label)
             cursor = next
         }
-        if (cursor < words.size) commitWords(recordingId, words.subList(cursor, words.size), speaker)
+        if (cursor < words.size) commitWords(recordingId, words.subList(cursor, words.size), speaker, decodedBytes)
     }
 
-    private fun commitWords(recordingId: Long, shifted: List<TranscriptWord>, speaker: String?) {
+    private suspend fun commitWords(recordingId: Long, shifted: List<TranscriptWord>, speaker: String?, decodedBytes: Long) {
         if (shifted.isEmpty()) return
         val update = paragraphAccumulator.acceptCommit(shifted, speaker)
+        // Only durable words advance the recovery point. A native push may still be holding the rest.
+        val processed = ((shifted.last().end * GroqAsrClient.PCM_BYTES_PER_SECOND).toLong() and -2L)
+            .coerceIn(processedSpoolBytes.get(), decodedBytes)
+        var revised: ParagraphEntity? = null
+        var added: ParagraphEntity? = null
         update.updatedLastParagraph?.let { draft ->
-            val updatedEntity = ParagraphEntity(
+            revised = ParagraphEntity(
                 id = currentParagraphEntityId,
                 recordingId = recordingId,
                 orderIndex = (nextOrderIndex - 1).coerceAtLeast(0),
@@ -1014,15 +1243,11 @@ class RecordingForegroundService : Service() {
                 bookmarkLabel = draft.bookmarkLabel,
                 speaker = draft.speaker
             )
-            runBlocking { app.repository.updateParagraph(updatedEntity) }
-            if (committedList.isNotEmpty()) {
-                committedList[committedList.lastIndex] = updatedEntity
-            }
         }
         update.newParagraph?.let { draft ->
-            val newEntity = ParagraphEntity(
+            added = ParagraphEntity(
                 recordingId = recordingId,
-                orderIndex = nextOrderIndex++,
+                orderIndex = nextOrderIndex,
                 startSec = draft.startSec,
                 endSec = draft.endSec,
                 text = draft.text,
@@ -1031,18 +1256,24 @@ class RecordingForegroundService : Service() {
                 bookmarkLabel = draft.bookmarkLabel,
                 speaker = draft.speaker
             )
-            val rowId = runBlocking { app.repository.insertParagraph(newEntity) }
-            currentParagraphEntityId = rowId
-            committedList.add(newEntity.copy(id = rowId))
         }
-        _uiState.update { state ->
+        if (revised == null && added == null) return
+        val ids = app.repository.commitLiveTranscript(recordingId, listOfNotNull(added), processed, revised)
+        processedSpoolBytes.set(processed)
+        revised?.let { committedList[committedList.lastIndex] = it }
+        added?.let {
+            currentParagraphEntityId = ids.single()
+            nextOrderIndex++
+            committedList.add(it.copy(id = currentParagraphEntityId))
+        }
+        updateAsrUi(recordingId) { state ->
             state.copy(
                 committedParagraphs = committedList.toList()
             )
         }
     }
 
-    private fun handleAsrEvents(rawJson: String?, onCommit: (List<TranscriptWord>) -> Unit) {
+    private fun handleAsrEvents(recordingId: Long, rawJson: String?, timeOffsetSec: Float, onCommit: (List<TranscriptWord>) -> Unit) {
         val events = AsrJsonParser.parseEvents(rawJson)
         if (events.isEmpty()) return
 
@@ -1052,7 +1283,7 @@ class RecordingForegroundService : Service() {
                     val shifted = if (timeOffsetSec == 0f) ev.words else ev.words.map {
                         it.copy(start = it.start + timeOffsetSec, end = it.end + timeOffsetSec)
                     }
-                    _uiState.update { it.copy(openWords = emptyList(), tailWords = emptyList()) }
+                    updateAsrUi(recordingId) { it.copy(openWords = emptyList(), tailWords = emptyList()) }
                     onCommit(shifted)
                 }
                 is AsrEvent.Partial -> {
@@ -1062,7 +1293,7 @@ class RecordingForegroundService : Service() {
                     val tailShifted = if (timeOffsetSec == 0f) ev.tail else ev.tail.map {
                         it.copy(start = it.start + timeOffsetSec, end = it.end + timeOffsetSec)
                     }
-                    _uiState.update { state ->
+                    updateAsrUi(recordingId) { state ->
                         state.copy(
                             openWords = openShifted,
                             tailWords = tailShifted
@@ -1070,7 +1301,9 @@ class RecordingForegroundService : Service() {
                     }
                 }
                 is AsrEvent.Language -> {
-                    _uiState.update { it.copy(activeLanguage = ev.lang) }
+                    val merged = mergeDetectedLanguages(observedLiveLang.get(), ev.lang)
+                    observedLiveLang.set(merged)
+                    updateAsrUi(recordingId) { it.copy(activeLanguage = merged ?: ev.lang) }
                 }
                 is AsrEvent.Eou -> Unit
             }
@@ -1083,34 +1316,49 @@ class RecordingForegroundService : Service() {
         val spoolFile = File(rec.asrSpoolPath)
         val totSpool = totalSpoolBytes.get()
         val procSpool = processedSpoolBytes.get()
-        val fullyProcessed = procSpool >= (totSpool - 3200L).coerceAtLeast(0L)
-
         val state = destroyedSnapshot ?: _uiState.value
         val finalDur = state.durationMs.coerceAtLeast(totSpool * 1000L / GroqAsrClient.PCM_BYTES_PER_SECOND)
+        val totalAudioBytes = if (spoolCaptureFailed.get()) maxOf(totSpool, finalDur * 32L) else totSpool
+        val fullyProcessed = procSpool >= (totalAudioBytes - 3200L).coerceAtLeast(0L)
+        val captureFailed = originalCaptureFailed.get()
+        val clearSpool = fullyProcessed && !captureFailed
         var failure: String? = null
+        var savedRecordingId: Long? = null
         try {
-            val latest = app.repository.getRecording(rec.id) ?: return
-            val paragraphs = app.repository.getParagraphs(rec.id)
-            val wordCount = paragraphs.sumOf { p -> p.text.split(Regex("\\s+")).count { it.isNotBlank() } }
-            val preview = paragraphs.asSequence().map { it.text }.take(20).joinToString(" ").take(220)
-            app.repository.updateRecording(
+            if (!capturedAudio.get() && totSpool == 0L) {
+                app.repository.discardEmptyCapture(rec)
+                failure = state.asrError ?: AppLocaleManager.currentStrings().audioFileNotFound
+                return
+            }
+            val bookmarks = localParagraphBreaks.mapNotNull { mark ->
+                val label = mark.label ?: return@mapNotNull null
+                ParagraphEntity(
+                    recordingId = rec.id, orderIndex = nextOrderIndex++, startSec = mark.atSec, endSec = mark.atSec,
+                    text = "", wordsJson = "", isBookmark = true, bookmarkLabel = label
+                )
+            }
+            val saved = app.repository.completeCapture(rec.id, bookmarks) { latest ->
                 latest.copy(
-                    status = RecordingStatus.COMPLETED.name,
+                    status = if (captureFailed) RecordingStatus.INTERRUPTED.name else RecordingStatus.COMPLETED.name,
                     durationMs = finalDur,
-                    fileSizeBytes = if (audioFile.exists()) audioFile.length() else 0L,
-                    asrSpoolPath = if (fullyProcessed) "" else rec.asrSpoolPath,
-                    totalAsrBytes = totSpool,
+                    fileSizeBytes = if (audioFile.isFile) audioFile.length() else 0L,
+                    asrSpoolPath = when {
+                        clearSpool -> ""
+                        spoolCaptureFailed.get() && !spoolFile.isFile -> rec.audioPath
+                        else -> rec.asrSpoolPath
+                    },
+                    totalAsrBytes = totalAudioBytes,
                     processedAsrBytes = procSpool,
                     modelId = state.modelId,
                     languagePresetId = state.languagePresetId,
-                    detectedLanguage = state.activeLanguage,
-                    hasTranscript = paragraphs.isNotEmpty(),
-                    wordCount = wordCount,
-                    previewText = preview,
-                    updatedAtMs = System.currentTimeMillis()
+                    detectedLanguage = observedLiveLang.get() ?: state.activeLanguage
                 )
-            )
-            if (fullyProcessed && spoolFile.absolutePath != audioFile.absolutePath) spoolFile.delete()
+            }
+            if (saved) {
+                savedRecordingId = rec.id
+                if (clearSpool && spoolFile.absolutePath != audioFile.absolutePath) spoolFile.delete()
+                app.applicationScope.launch { runCatching { app.repository.backfillLearnedVoiceSamples(rec.id) } }
+            }
         } catch (e: Exception) {
             failure = e.message ?: AppLocaleManager.currentStrings().audioWriteError
         } finally {
@@ -1118,10 +1366,14 @@ class RecordingForegroundService : Service() {
                 if (!destroyed.get()) {
                     releaseAudioFocus()
                     releaseWakeLock()
-                    val notice = failure ?: _uiState.value.asrError ?: if (state.isGroqEngine && !fullyProcessed) {
-                        "Аудио сохранено. Оставшийся фрагмент можно расшифровать в библиотеке."
+                    val notice = failure ?: _uiState.value.asrError ?: if (captureFailed) {
+                        AppLocaleManager.currentStrings().audioWriteError
+                    } else if (!fullyProcessed) {
+                        if (AppLocaleManager.currentLanguage.value.code == "ru") {
+                            "Аудио сохранено. Оставшийся фрагмент можно распознать в записи."
+                        } else "Audio saved. You can transcribe the remaining audio from the recording."
                     } else null
-                    _uiState.value = LiveRecordingUiState(finishedRecordingId = rec.id, asrError = notice)
+                    _uiState.value = LiveRecordingUiState(finishedRecordingId = savedRecordingId, asrError = notice)
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                     currentRecording = null
@@ -1154,7 +1406,7 @@ class RecordingForegroundService : Service() {
         val strings = AppLocaleManager.currentStrings()
         pausedByAudioFocus.set(false)
         requestAudioFocus()
-        isPausedFlag.set(false)
+        if (!isPausedFlag.compareAndSet(true, false) || stopRequested.get()) return
         _uiState.update { state ->
             state.copy(
                 isPaused = false,
@@ -1165,7 +1417,7 @@ class RecordingForegroundService : Service() {
     }
 
     fun addBookmark(customLabel: String? = null) {
-        if (!isRecordingFlag.get()) return
+        if (!isRecordingFlag.get() || stopRequested.get()) return
         val strings = AppLocaleManager.currentStrings()
         val label = customLabel?.takeIf { it.isNotBlank() }
             ?: "${strings.bookmarkDefaultLabel} ${AsrTextFormatter.formatDurationMs(_uiState.value.durationMs)}"
@@ -1212,7 +1464,9 @@ class RecordingForegroundService : Service() {
                                 liveAiLang,
                                 paragraphs.getOrNull(index - 1)?.text.orEmpty(),
                                 paragraphs.getOrNull(index + 1)?.text.orEmpty(),
-                                "", {}
+                                "",
+                                neuralNoiseSuppression = settings.neuralNoiseSuppression,
+                                onProgress = {}
                             )
                             coroutineContext.ensureActive()
                             if (result.proposal.uncertain.isEmpty() && result.proposal.correctedText != paragraph.text &&
@@ -1248,8 +1502,10 @@ class RecordingForegroundService : Service() {
     }
 
     fun switchLanguagePreset(presetId: String) {
-        if (!isRecordingFlag.get()) return
-        requestedPresetSwitch = presetId
+        val state = _uiState.value
+        if (!isRecordingFlag.get() || stopRequested.get() || state.isGroqEngine) return
+        requestedPresetSwitch.set(PresetSwitch(state.recordingId, presetId, totalSpoolBytes.get()))
+        synchronized(spoolLock) { spoolLock.notifyAll() }
     }
 
     fun stopRecording() {
@@ -1264,10 +1520,11 @@ class RecordingForegroundService : Service() {
         _uiState.update { state ->
             state.copy(
                 isFinishing = true,
-                asrStatusText = strings.finishingTranscript
+                asrStatusText = strings.notifSaving
             )
         }
         updateNotification(strings.notifSaving, isPaused = false)
+        synchronized(spoolLock) { spoolLock.notifyAll() }
     }
 
     private fun requestAudioFocus() {
@@ -1415,7 +1672,9 @@ class RecordingForegroundService : Service() {
         stopRequested.set(true)
         val id = currentRecording?.id
         destroyedSnapshot = _uiState.value.takeIf { it.recordingId == id }
-        _uiState.update { if (it.isActive && it.recordingId == id) LiveRecordingUiState() else it }
+        _uiState.update { state ->
+            if (state.isStarting || (state.isActive && state.recordingId == id)) LiveRecordingUiState() else state
+        }
         synchronized(spoolLock) { spoolLock.notifyAll() }
         releaseAudioFocus()
         releaseWakeLock()

@@ -46,9 +46,9 @@ class StenografApp : Application() {
 
         database = StenografDatabase.getInstance(this)
         preferences = AppPreferences(this)
-        repository = RecordingRepository(this, database.dao())
+        repository = RecordingRepository(this, database)
         modelManager = ModelManager(this)
-        reTranscribeWorker = ReTranscribeWorker(this, repository, modelManager)
+        reTranscribeWorker = ReTranscribeWorker(this, repository, modelManager, preferences)
 
         recordingRecovery = applicationScope.launch {
             val initialCode = runCatching { preferences.settingsFlow.first().uiLanguageCode }.getOrDefault("system")
@@ -60,9 +60,9 @@ class StenografApp : Application() {
                 _recoveredRecordings.value = recovered
             }
             repository.cleanupOrphanedFiles(modelManager)
-            modelManager.ensureVadInstalled()
         }
 
+        applicationScope.launch { modelManager.ensureVadInstalled() }
         applicationScope.launch {
             preferences.settingsFlow
                 .map { it.uiLanguageCode }

@@ -32,6 +32,10 @@ enum class AsrEngineMode {
     GROQ_API
 }
 
+enum class RecognitionAudioFilter {
+    STANDARD, FAST, OFF
+}
+
 data class AppSettings(
     val uiLanguageCode: String = "system",
     val languagePresetId: String = "ru_only",
@@ -51,8 +55,18 @@ data class AppSettings(
     val groqModelId: String = GroqAsrClient.DEFAULT_MODEL_ID,
     val groqLanguageMode: String = GroqAsrClient.DEFAULT_LANGUAGE_MODE,
     val transcriptReviewModelId: String = TranscriptReviewModel.Detailed.id,
-    val speakerDiarization: Boolean = true
-)
+    val speakerDiarization: Boolean = true,
+    val neuralNoiseSuppression: Boolean = true,
+    val fastEnhancer: Boolean = false,
+    val autoLearnSpeakers: Boolean = true
+) {
+    val recognitionAudioFilter: RecognitionAudioFilter
+        get() = when {
+            !neuralNoiseSuppression -> RecognitionAudioFilter.OFF
+            fastEnhancer -> RecognitionAudioFilter.FAST
+            else -> RecognitionAudioFilter.STANDARD
+        }
+}
 
 class AppPreferences(private val context: Context) {
     private object Keys {
@@ -75,6 +89,9 @@ class AppPreferences(private val context: Context) {
         val GROQ_LANGUAGE_MODE = stringPreferencesKey("groq_language_mode")
         val TRANSCRIPT_REVIEW_MODEL = stringPreferencesKey("transcript_review_model")
         val SPEAKER_DIARIZATION = booleanPreferencesKey("speaker_diarization")
+        val NEURAL_NOISE_SUPPRESSION = booleanPreferencesKey("neural_noise_suppression")
+        val FAST_ENHANCER = booleanPreferencesKey("fast_enhancer")
+        val AUTO_LEARN_SPEAKERS = booleanPreferencesKey("auto_learn_speakers")
     }
 
     val settingsFlow: Flow<AppSettings> = context.dataStore.data.map { prefs ->
@@ -106,7 +123,10 @@ class AppPreferences(private val context: Context) {
             transcriptReviewModelId = TranscriptReviewModel.resolve(prefs[Keys.TRANSCRIPT_REVIEW_MODEL]).id,
             speakerDiarization = prefs[Keys.SPEAKER_DIARIZATION]
                 ?: prefs[booleanPreferencesKey("groq_speaker_diarization")]
-                ?: prefs[booleanPreferencesKey("gemini_speaker_diarization")] ?: true
+                ?: prefs[booleanPreferencesKey("gemini_speaker_diarization")] ?: true,
+            neuralNoiseSuppression = prefs[Keys.NEURAL_NOISE_SUPPRESSION] ?: true,
+            fastEnhancer = prefs[Keys.FAST_ENHANCER] ?: false,
+            autoLearnSpeakers = prefs[Keys.AUTO_LEARN_SPEAKERS] ?: true
         )
     }
 
@@ -175,6 +195,19 @@ class AppPreferences(private val context: Context) {
 
     suspend fun setSpeakerDiarization(enabled: Boolean) {
         context.dataStore.edit { it[Keys.SPEAKER_DIARIZATION] = enabled }
+    }
+
+    suspend fun setRecognitionAudioFilter(filter: RecognitionAudioFilter) {
+        context.dataStore.edit {
+            it[Keys.NEURAL_NOISE_SUPPRESSION] = filter != RecognitionAudioFilter.OFF
+            if (filter != RecognitionAudioFilter.OFF) {
+                it[Keys.FAST_ENHANCER] = filter == RecognitionAudioFilter.FAST
+            }
+        }
+    }
+
+    suspend fun setAutoLearnSpeakers(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.AUTO_LEARN_SPEAKERS] = enabled }
     }
 
     suspend fun setThemeMode(mode: ThemeMode) {

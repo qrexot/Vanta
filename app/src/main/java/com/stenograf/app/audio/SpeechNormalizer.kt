@@ -82,7 +82,10 @@ class SpeechNormalizer(
 
         // 2. Update adaptive ambient noise floor (ignores near-zero digital silence)
         if (frameRms > 1e-5f) {
-            if (frameRms < noiseFloorRms) {
+            if (frameRms < noiseFloorRms * 0.6f) {
+                // Fast downward step when entering silence or after neural speech enhancement removes steady noise.
+                noiseFloorRms = noiseFloorRms * 0.72f + frameRms * 0.28f
+            } else if (frameRms < noiseFloorRms) {
                 noiseFloorRms = noiseFloorRms * 0.90f + frameRms * 0.10f
             } else if (frameRms < noiseFloorRms * 2.2f) {
                 noiseFloorRms = noiseFloorRms * 0.992f + frameRms * 0.008f
@@ -91,7 +94,7 @@ class SpeechNormalizer(
         }
 
         // 3. Speech-gated target gain with hangover and peak-safe headroom
-        val speechThreshold = maxOf(0.0022f, noiseFloorRms * 2.15f)
+        val speechThreshold = maxOf(0.0016f, noiseFloorRms * 2.05f)
         val isSpeech = frameRms > speechThreshold
         val peakSafeMax = if (peak > 1e-4f) (0.92f / peak) else maxGain
 
@@ -215,57 +218,104 @@ class SpeechNormalizer(
         }
 
         /**
-         * Streams [startByte .. endByte) of [srcPcm] through [SpeechNormalizer] into [dstPcm],
-         * preserving exact sample count and durations for ASR timestamp alignment.
+         * Streams [startByte .. endByte) of [srcPcm] through optional neural noise suppression ([enhancer])
+         * followed by [SpeechNormalizer] into [dstPcm], preserving exact sample count and durations for ASR alignment.
          */
-        fun writeNormalizedPcm16Window(
+        internal fun writeNormalizedPcm16Window(
             srcPcm: File,
             startByte: Long,
             endByte: Long,
             dstPcm: File,
             stats: SpeechAnalysisStats,
-            onCheckCancelled: () -> Unit = {}
+            onCheckCancelled: () -> Unit = {},
+            enhancer: NeuralSpeechEnhancer? = null,
+            applyNormalizer: Boolean = true
         ): Long {
             val chunkShorts = 640 // 40 ms
             val chunkBytes = chunkShorts * 2
+            val targetSamples = ((endByte - startByte).coerceAtLeast(0L) / 2L)
+            if (targetSamples <= 0L) {
+                FileOutputStream(dstPcm).close()
+                return 0L
+            }
             val byteBuf = ByteArray(chunkBytes)
             val shortBuf = ShortArray(chunkShorts)
-            val normalizer = SpeechNormalizer(
-                initialGain = stats.recommendedGain,
-                initialNoiseFloor = stats.noiseFloorRms
-            )
+            val effectiveInitialNoiseFloor = if (enhancer != null) {
+                // GTCRN removes broadband stationary noise before normalizer sees the samples;
+                // clamp raw pre-enhancer noise floor so early post-GTCRN speech is never gated out.
+                minOf(stats.noiseFloorRms, 0.0022f)
+            } else {
+                stats.noiseFloorRms
+            }
+            val normalizer = if (applyNormalizer) {
+                SpeechNormalizer(
+                    initialGain = stats.recommendedGain,
+                    initialNoiseFloor = effectiveInitialNoiseFloor
+                )
+            } else null
 
-            var writtenBytes = 0L
+            enhancer?.reset()
+            var writtenSamples = 0L
+            var writeBytesBuf = ByteArray(chunkBytes)
+
+            fun emitSamples(out: BufferedOutputStream, samples: ShortArray, available: Int) {
+                val toWrite = minOf(available.toLong(), targetSamples - writtenSamples).toInt()
+                if (toWrite <= 0) return
+                normalizer?.processInPlace(samples, toWrite)
+                val bytesNeeded = toWrite * 2
+                if (writeBytesBuf.size < bytesNeeded) {
+                    writeBytesBuf = ByteArray(bytesNeeded)
+                }
+                ByteBuffer.wrap(writeBytesBuf, 0, bytesNeeded)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .asShortBuffer()
+                    .put(samples, 0, toWrite)
+                out.write(writeBytesBuf, 0, bytesNeeded)
+                writtenSamples += toWrite
+            }
+
             RandomAccessFile(srcPcm, "r").use { raf ->
                 BufferedOutputStream(FileOutputStream(dstPcm), 64 * 1024).use { out ->
                     var pos = startByte and -2L
-                    while (pos < endByte) {
+                    raf.seek(pos)
+                    while (pos < endByte && writtenSamples < targetSamples) {
                         onCheckCancelled()
                         val toRead = minOf(chunkBytes.toLong(), endByte - pos).toInt() and -2
                         if (toRead < 2) break
-                        raf.seek(pos)
                         val got = raf.read(byteBuf, 0, toRead)
                         if (got < 2) break
-                        val nSamples = got / 2
-                        ByteBuffer.wrap(byteBuf, 0, nSamples * 2)
+                        val usableBytes = got and -2
+                        val nSamples = usableBytes / 2
+                        ByteBuffer.wrap(byteBuf, 0, usableBytes)
                             .order(ByteOrder.LITTLE_ENDIAN)
                             .asShortBuffer()
                             .get(shortBuf, 0, nSamples)
 
-                        normalizer.processInPlace(shortBuf, nSamples)
-
-                        ByteBuffer.wrap(byteBuf, 0, nSamples * 2)
-                            .order(ByteOrder.LITTLE_ENDIAN)
-                            .asShortBuffer()
-                            .put(shortBuf, 0, nSamples)
-                        out.write(byteBuf, 0, nSamples * 2)
-                        writtenBytes += nSamples * 2L
-                        pos += got
+                        if (enhancer != null) {
+                            val denoised = enhancer.processShorts(shortBuf, nSamples)
+                            emitSamples(out, denoised, denoised.size)
+                        } else {
+                            emitSamples(out, shortBuf, nSamples)
+                        }
+                        if (usableBytes < got) {
+                            raf.seek(pos + usableBytes)
+                        }
+                        pos += usableBytes
+                    }
+                    if (enhancer != null && writtenSamples < targetSamples) {
+                        val tail = enhancer.flushShorts()
+                        emitSamples(out, tail, tail.size)
+                    }
+                    // Pad trailing sample remainder (<1 frame shift) if denoiser produced fewer samples at boundary
+                    if (writtenSamples < targetSamples) {
+                        val rem = (targetSamples - writtenSamples).toInt()
+                        emitSamples(out, ShortArray(rem), rem)
                     }
                     out.flush()
                 }
             }
-            return writtenBytes
+            enhancer?.reset()
+            return writtenSamples * 2L
         }
     }
 }

@@ -189,11 +189,12 @@ class CoreLogicTest {
         assertTrue(frDe.bundledInApk)
         assertEquals(listOf("fr", "de"), frDe.languages)
 
-        // All presets must map to a valid TinyASR model in the catalog
+        // All presets must map to a valid downloadable ASR model in the catalog
         val modelIds = TinyAsrCatalog.MODELS.map { it.id }.toSet()
         assertEquals(9, modelIds.size)
+        val downloadableIds = TinyAsrCatalog.DOWNLOAD_MODELS.map { it.id }.toSet()
         for (preset in TinyAsrCatalog.PRESETS) {
-            assertTrue("Preset ${preset.id} references unknown model ${preset.modelId}", preset.modelId in modelIds)
+            assertTrue("Preset ${preset.id} references unknown model ${preset.modelId}", preset.modelId in downloadableIds)
         }
     }
 

@@ -5,12 +5,15 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 /** Converts microphone or decoded audio to 16 kHz PCM, rejecting frequencies that would alias into speech. */
-class StreamingResamplerTo16k(private val inputSampleRate: Int) {
-    private val ratio: Double = inputSampleRate / 16000.0
+class StreamingResamplerTo16k(
+    private val inputSampleRate: Int,
+    private val outputSampleRate: Int = 16_000
+) {
+    private val ratio: Double = inputSampleRate.toDouble() / outputSampleRate
     private var t: Double = 0.0
     private val filter = if (ratio > 1.0) {
         val half = 15
-        val cutoff = 6800.0 / inputSampleRate
+        val cutoff = (0.425 * outputSampleRate) / inputSampleRate
         val taps = DoubleArray(2 * half + 1) { index ->
             val offset = index - half
             val sinc = if (offset == 0) 2 * cutoff else sin(2 * PI * cutoff * offset) / (PI * offset)
@@ -28,7 +31,7 @@ class StreamingResamplerTo16k(private val inputSampleRate: Int) {
 
     fun process(input: ShortArray, count: Int): ShortArray {
         if (count <= 0) return ShortArray(0)
-        if (inputSampleRate == 16000) {
+        if (inputSampleRate == outputSampleRate) {
             return if (count == input.size) input.copyOf() else input.copyOfRange(0, count)
         }
 

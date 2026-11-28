@@ -34,6 +34,8 @@ pub(crate) const PAD: i64 = 6;
 /// re-decode, so this is how soon the right word shows. A slow device re-decodes less often: the gap after each one is
 /// twice its time (at most ~1/3 of real time).
 const REFRESH: i64 = 5120;
+/// During continuous multilingual speech the cheap streaming pass still updates at its normal cadence.
+const MULTILINGUAL_REFRESH: i64 = 19200;
 /// Audio a re-decode must have heard after a sentence end it writes before that sentence is frozen (s).
 const SURE: f64 = 1.5;
 /// Re-decoded length that forces a cut at the longest pause.
@@ -510,9 +512,10 @@ impl<'m> Session<'m> {
             self.full_dirty = true; // the stream heard something even if the VAD did not say so
         }
         // at most ~1/3 of real time on re-decodes: the next one waits for 2x the audio the last one took to decode
+        let refresh = if self.langs.len() > 1 { MULTILINGUAL_REFRESH } else { REFRESH };
         if self.full_dirty
             && (self.pos - self.full_at) as f64 >= self.gap
-            && (self.quiet >= PAUSE || self.pos - self.full_at >= REFRESH)
+            && (self.quiet >= PAUSE || self.pos - self.full_at >= refresh)
         {
             self.redecode();
         }

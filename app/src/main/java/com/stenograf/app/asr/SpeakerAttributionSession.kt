@@ -8,6 +8,10 @@ import kotlinx.coroutines.CancellationException
 internal class SpeakerAttributionSession(
     private val assets: AssetManager,
     private val label: String,
+    private val autoVoicePrefix: String = label,
+    private val autoLearnSpeakers: Boolean = false,
+    private val storedProfiles: List<StoredVoiceprint> = emptyList(),
+    private val onPersistUpdates: (List<LearnedVoiceprintUpdate>) -> Unit = {},
     private val onUnavailable: () -> Unit = {}
 ) : Closeable {
     private var diarizer: SpeakerDiarizer? = null
@@ -18,10 +22,28 @@ internal class SpeakerAttributionSession(
     fun analyze(pcm: ByteArray, offsetBytes: Long, cancelled: () -> Boolean): SpeakerTimeline =
         withDiarizer(SpeakerTimeline.Empty) { it.analyze(pcm, offsetBytes, cancelled) }
 
+    fun flushLearned() {
+        if (!autoLearnSpeakers) return
+        val updates = diarizer?.drainLearnedUpdates().orEmpty()
+        if (updates.isNotEmpty()) {
+            onPersistUpdates(updates)
+        }
+    }
+
     private fun <T> withDiarizer(fallback: T, action: (SpeakerDiarizer) -> T): T {
         if (failed) return fallback
         try {
-            val model = diarizer ?: SpeakerDiarizer(assets, label).also { diarizer = it }
+            val model = diarizer ?: SpeakerDiarizer(
+                assets = assets,
+                label = label,
+                autoVoicePrefix = autoVoicePrefix,
+                autoLearnSpeakers = autoLearnSpeakers
+            ).also {
+                if (storedProfiles.isNotEmpty()) {
+                    it.seedStoredProfiles(storedProfiles)
+                }
+                diarizer = it
+            }
             return action(model)
         } catch (e: CancellationException) {
             throw e
@@ -40,6 +62,7 @@ internal class SpeakerAttributionSession(
     }
 
     override fun close() {
+        runCatching { flushLearned() }
         diarizer?.close()
     }
 }

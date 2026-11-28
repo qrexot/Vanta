@@ -1594,14 +1594,28 @@ impl Model {
 
     /// Full-context encoder output (frames at 25 Hz x 512) for fbank features (t x 80).
     pub fn encode_full(&self, feats: &[f32], t: usize, lang: usize) -> (Vec<f32>, usize) {
-        // the front end's buffers (each t x 19 x 128) go as soon as they are used, before the encoder runs
-        let (mut e, tc) = {
-            // with ConvNeXt's 3 rows of zero context on each side
-            let (rows, tc) = self.embed.convs(feats, t, 3);
-            let x = self.embed.convnext(&rows, tc + 6);
-            drop(rows);
-            (self.embed.finish(&x, tc), tc)
-        };
+        let (embedded, tc) = self.embed_full(feats, t);
+        self.encode_embedded(embedded, tc, lang)
+    }
+
+    fn embed_full(&self, feats: &[f32], t: usize) -> (Vec<f32>, usize) {
+        // ConvNeXt needs three rows of zero context on each side.
+        let (rows, tc) = self.embed.convs(feats, t, 3);
+        let x = self.embed.convnext(&rows, tc + 6);
+        drop(rows);
+        (self.embed.finish(&x, tc), tc)
+    }
+
+    pub(crate) fn embed_audio(&self, audio: &[f32]) -> Option<(Vec<f32>, usize)> {
+        let t = Fbank::num_frames(audio.len());
+        if t < 16 {
+            return None;
+        }
+        let feats = Fbank::new().frames(audio, 0, t);
+        Some(self.embed_full(&feats, t))
+    }
+
+    pub(crate) fn encode_embedded(&self, mut e: Vec<f32>, tc: usize, lang: usize) -> (Vec<f32>, usize) {
         let lv = &self.lang_vec[lang];
         e.chunks_exact_mut(lv.len()).for_each(|r| add(r, lv));
         self.encode(e, tc, None, &[])

@@ -23,6 +23,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -92,7 +93,7 @@ internal fun TranscriptReviewSheet(
     var modelId by rememberSaveable { mutableStateOf(TranscriptReviewModel.resolve(preferredModelId).id) }
     var hint by rememberSaveable { mutableStateOf("") }
     var review by remember { mutableStateOf<AudioReview?>(null) }
-    var progress by remember { mutableStateOf(0f) }
+    var progress by remember { mutableFloatStateOf(0f) }
     var russianAudio by rememberSaveable { mutableStateOf(russianAudioByDefault) }
     var groqLanguageOverride by rememberSaveable { mutableStateOf("auto") }
     var showLanguagePicker by rememberSaveable { mutableStateOf(false) }
@@ -325,7 +326,7 @@ internal fun TranscriptReviewSheet(
                         }
                         if (!wholeRecording) {
                             VantaTonalButton(
-                                label = if (russian) "Распознать локально · TinyASR" else "Recognize on device · TinyASR",
+                                label = if (russian) "Распознать локально" else "Recognize on device",
                                 modifier = Modifier.fillMaxWidth(),
                                 onClick = { recognize(null) }
                             )

@@ -1,90 +1,70 @@
 package com.stenograf.app.ui.screens
 
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.animateContentSize
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DeleteOutline
-import androidx.compose.material.icons.rounded.Download
-import androidx.compose.material.icons.rounded.FileUpload
-import androidx.compose.material.icons.rounded.Pause
-import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Refresh
-import androidx.compose.material.icons.rounded.Storage
-import androidx.compose.material.icons.rounded.Translate
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Icon
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.stenograf.app.asr.ModelDownloadPhase
+import com.stenograf.app.asr.ModelDownloadProgress
 import com.stenograf.app.asr.ModelInstallStatus
 import com.stenograf.app.asr.TinyAsrCatalog
 import com.stenograf.app.asr.TinyAsrModelSpec
+import com.stenograf.app.audio.AudioTreatment
+import com.stenograf.app.data.prefs.RecognitionAudioFilter
+import com.stenograf.app.i18n.AppLocaleManager
 import com.stenograf.app.i18n.AppStrings
 import com.stenograf.app.i18n.LocalExtraStrings
 import com.stenograf.app.i18n.LocalStrings
 import com.stenograf.app.ui.components.GlassScaffold
-import com.stenograf.app.ui.components.EmptyStateView
 import com.stenograf.app.ui.components.SheetOptionRow
-import com.stenograf.app.ui.components.StatusPill
 import com.stenograf.app.ui.components.VantaBottomSheet
 import com.stenograf.app.ui.components.VantaDialog
 import com.stenograf.app.ui.components.VantaIconButton
-import com.stenograf.app.ui.components.VantaInfoCallout
 import com.stenograf.app.ui.components.VantaLinearProgressTrack
 import com.stenograf.app.ui.components.VantaPrimaryButton
 import com.stenograf.app.ui.components.VantaSearchField
 import com.stenograf.app.ui.components.VantaTonalButton
 import com.stenograf.app.ui.components.VantaTopBar
-import com.stenograf.app.ui.components.formatEtaDuration
 import com.stenograf.app.ui.components.formatStorageSize
-import com.stenograf.app.ui.components.formatTransferSpeed
 import com.stenograf.app.ui.theme.LocalStenografColors
-import com.stenograf.app.ui.theme.Motion
 import com.stenograf.app.ui.theme.Radius
 import com.stenograf.app.ui.theme.Spacing
 import com.stenograf.app.ui.theme.VantaType
-import com.stenograf.app.ui.theme.pressScale
-import com.stenograf.app.ui.theme.rememberVantaHaptics
 import com.stenograf.app.ui.theme.vantaSurfaceCard
-import java.util.Locale
 
-private enum class ModelFilter { ALL, INSTALLED, AVAILABLE }
+private enum class ModelCategory { SPEECH, FILTERS }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ModelManagerScreen(
     modelStatuses: List<ModelInstallStatus>,
@@ -98,583 +78,391 @@ fun ModelManagerScreen(
     onPauseDownload: (String) -> Unit,
     onCancelDownload: (String) -> Unit,
     onImportModel: (String) -> Unit,
-    onDeleteModel: (String) -> Unit
+    onDeleteModel: (String) -> Unit,
+    recognitionFilter: RecognitionAudioFilter,
+    onSelectRecognitionFilter: (RecognitionAudioFilter) -> Unit
 ) {
     val colors = LocalStenografColors.current
-    val s = LocalStrings.current
-    val extra = LocalExtraStrings.current
-    val haptics = rememberVantaHaptics()
-    val listState = rememberLazyListState()
+    val strings = LocalStrings.current
+    val language by AppLocaleManager.currentLanguage.collectAsState()
+    val russian = language.code == "ru"
+    var category by rememberSaveable { mutableStateOf(ModelCategory.SPEECH) }
+    var search by rememberSaveable { mutableStateOf("") }
+    var showRecognitionFilter by remember { mutableStateOf(false) }
+    var details by remember { mutableStateOf<TinyAsrModelSpec?>(null) }
+    var delete by remember { mutableStateOf<TinyAsrModelSpec?>(null) }
+    var languagePicker by remember { mutableStateOf<TinyAsrModelSpec?>(null) }
 
-    var searchQuery by remember { mutableStateOf("") }
-    var filter by remember { mutableStateOf(ModelFilter.ALL) }
-    var deleteConfirmModel by remember { mutableStateOf<ModelInstallStatus?>(null) }
-    var presetPickerModel by remember { mutableStateOf<TinyAsrModelSpec?>(null) }
-
-    val filtered = remember(modelStatuses, searchQuery, filter, s) {
-        modelStatuses.filter { st ->
-            val matchesFilter = when (filter) {
-                ModelFilter.ALL -> true
-                ModelFilter.INSTALLED -> st.isInstalled
-                ModelFilter.AVAILABLE -> !st.isInstalled
-            }
-            matchesFilter && st.spec.matchesQuery(searchQuery, s)
-        }
-    }
-
-    val installedCount = remember(modelStatuses) { modelStatuses.count { it.isInstalled } }
-    val availableCount = modelStatuses.size - installedCount
-    val totalModelsBytes = remember(modelStatuses) {
-        modelStatuses.filter { it.isInstalled }.sumOf {
-            if (it.sizeBytes > 0L) it.sizeBytes else (it.spec.sizeMb * 1024f * 1024f).toLong()
-        }
-    }
-    val activePreset = remember(activePresetId) { TinyAsrCatalog.findPreset(activePresetId) }
-
-    GlassScaffold(
-        topBar = {
-            VantaTopBar(
-                onBack = onBack,
-                title = s.modelManagerTitle
-            ) {
-                if (isCheckingUpdates) {
-                    Box(
-                        modifier = Modifier.size(44.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp),
-                            strokeWidth = 2.dp,
-                            color = colors.accent
-                        )
-                    }
-                } else {
-                    VantaIconButton(
-                        icon = Icons.Rounded.Refresh,
-                        contentDescription = s.modelUpdateButton,
-                        onClick = {
-                            haptics.tick()
-                            onCheckUpdates()
-                        }
-                    )
-                }
+    val preset = TinyAsrCatalog.findPreset(activePresetId)
+    val speechModels = modelStatuses.filter { AudioTreatment.forModel(it.spec.id) == null }
+        .sortedBy { status ->
+            when {
+                status.spec.id == preset.modelId -> 0
+                status.spec.id == "en-ru-uk" -> 1
+                status.spec.bundledInApk -> 2
+                status.isInstalled -> 3
+                status.spec.id == TinyAsrCatalog.GIGAAM_V4 -> 4
+                else -> 5
             }
         }
-    ) { overlayPadding ->
+    val shownSpeech = speechModels.filter { status ->
+        status.spec.matchesQuery(search, strings) ||
+            (russian && search.isNotBlank() && speechSummary(status.spec, true).contains(search.trim(), ignoreCase = true))
+    }
+    val statusesById = modelStatuses.associateBy { it.spec.id }
+
+    GlassScaffold(topBar = {
+        VantaTopBar(onBack = onBack, title = LocalExtraStrings.current.modelsShort) {
+            if (isCheckingUpdates) {
+                CircularProgressIndicator(color = colors.accent, strokeWidth = 2.dp, modifier = Modifier.padding(Spacing.sm))
+            } else {
+                VantaIconButton(
+                    icon = Icons.Rounded.Refresh,
+                    contentDescription = if (russian) "Проверить обновления моделей" else "Check model updates",
+                    onClick = onCheckUpdates
+                )
+            }
+        }
+    }) { padding ->
         LazyColumn(
-            state = listState,
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(
                 start = Spacing.lg,
                 end = Spacing.lg,
-                top = overlayPadding.calculateTopPadding() + Spacing.xs,
-                bottom = Spacing.xxl + bottomDockClearance
+                top = padding.calculateTopPadding() + Spacing.xs,
+                bottom = padding.calculateBottomPadding() + bottomDockClearance + Spacing.xl
             ),
-            verticalArrangement = Arrangement.spacedBy(Spacing.md)
+            verticalArrangement = Arrangement.spacedBy(Spacing.sm)
         ) {
-            item(key = "storage-summary") {
-                Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .vantaSurfaceCard(colors, radius = Radius.lg, elevated = false)
-                            .padding(horizontal = Spacing.lg, vertical = Spacing.md),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = extra.totalModelsStorageLabel,
-                                color = colors.textSecondary,
-                                style = VantaType.bodySmall
-                            )
-                            Spacer(Modifier.height(2.dp))
-                            Text(
-                                text = formatStorageSize(totalModelsBytes),
-                                color = colors.textPrimary,
-                                style = VantaType.sheetTitle.copy(
-                                    fontFamily = VantaType.monoMetric.fontFamily,
-                                    fontFeatureSettings = "tnum"
-                                )
-                            )
-                        }
-                        Row(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(Radius.pill))
-                                .background(colors.accentSoft)
-                                .padding(horizontal = 10.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(5.dp)
-                        ) {
-                            Icon(Icons.Rounded.Translate, null, tint = colors.accent, modifier = Modifier.size(14.dp))
-                            Text(
-                                text = activePreset.shortLabel,
-                                color = colors.accent,
-                                style = VantaType.monoBadge
-                            )
-                        }
-                    }
-                }
-            }
-
-            item(key = "catalog-controls") {
-                Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
-                    VantaInfoCallout(text = s.modelAsrNote)
-
-                    VantaSearchField(
-                        value = searchQuery,
-                        onValueChange = { searchQuery = it },
-                        placeholder = s.modelSearchHint
+            item(key = "category") {
+                Row(horizontalArrangement = Arrangement.spacedBy(Spacing.sm), modifier = Modifier.fillMaxWidth()) {
+                    ModelTab(
+                        label = if (russian) "Распознавание" else "Transcription",
+                        selected = category == ModelCategory.SPEECH,
+                        modifier = Modifier.weight(1f),
+                        onClick = { category = ModelCategory.SPEECH }
                     )
-
-                    FlowRow(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
-                        verticalArrangement = Arrangement.spacedBy(Spacing.xs)
-                    ) {
-                        val chips = listOf(
-                            Triple(ModelFilter.ALL, s.modelFilterAll, modelStatuses.size),
-                            Triple(ModelFilter.INSTALLED, s.modelFilterInstalled, installedCount),
-                            Triple(ModelFilter.AVAILABLE, s.modelFilterAvailable, availableCount)
-                        )
-                        for ((f, label, count) in chips) {
-                            val active = filter == f
-                            val bg by animateColorAsState(
-                                targetValue = if (active) colors.accentSoft else colors.surface,
-                                animationSpec = Motion.fastTween(),
-                                label = "m_filter_bg"
-                            )
-                            val borderColor by animateColorAsState(
-                                targetValue = if (active) colors.accent.copy(alpha = 0.42f) else colors.border,
-                                animationSpec = Motion.fastTween(),
-                                label = "m_filter_border"
-                            )
-                            Row(
-                                modifier = Modifier
-                                    .pressScale(pressedScale = 0.95f)
-                                    .clip(RoundedCornerShape(Radius.pill))
-                                    .background(bg)
-                                    .border(0.75.dp, borderColor, RoundedCornerShape(Radius.pill))
-                                    .clickable {
-                                        haptics.tick()
-                                        filter = f
-                                    }
-                                    .padding(horizontal = Spacing.md, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Text(
-                                    text = label,
-                                    color = if (active) colors.accent else colors.textSecondary,
-                                    style = VantaType.bodySmall.copy(
-                                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium
-                                    )
-                                )
-                                Text(
-                                    text = count.toString(),
-                                    color = if (active) colors.accent else colors.textMuted,
-                                    style = VantaType.monoBadge
-                                )
-                            }
-                        }
-                    }
+                    ModelTab(
+                        label = if (russian) "Фильтры" else "Audio filters",
+                        selected = category == ModelCategory.FILTERS,
+                        modifier = Modifier.weight(1f),
+                        onClick = { category = ModelCategory.FILTERS }
+                    )
                 }
             }
 
-            if (filtered.isEmpty()) {
-                item(key = "models_empty") {
-                    EmptyStateView(
-                        icon = Icons.Rounded.Storage,
-                        title = s.emptySearchTitle,
-                        subtitle = s.emptySearchSubtitle
+            if (category == ModelCategory.SPEECH) {
+                item(key = "active-preset") {
+                    Column(verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
+                        Text(
+                            if (russian) "Офлайн для новых записей · ${preset.label(strings)}"
+                            else "Offline for new recordings · ${preset.label(strings)}",
+                            color = colors.textSecondary,
+                            style = VantaType.bodySmall
+                        )
+                        VantaSearchField(
+                            value = search,
+                            onValueChange = { search = it },
+                            placeholder = if (russian) "Найти язык или модель" else "Find a language or model"
+                        )
+                    }
+                }
+                if (shownSpeech.isEmpty()) item(key = "no-models") {
+                    Text(
+                        if (modelStatuses.isEmpty()) strings.preparingModel else strings.emptySearchTitle,
+                        color = colors.textSecondary,
+                        style = VantaType.body
                     )
                 }
             } else {
-                items(filtered, key = { it.spec.id }) { st ->
-                    val isModelActive = activePreset.modelId == st.spec.id
-                    ModelCatalogCard(
-                        status = st,
-                        isActiveModel = isModelActive,
-                        strings = s,
-                        onDownload = {
-                            haptics.click()
-                            onDownloadModel(st.spec.id)
-                        },
-                        onPause = {
-                            haptics.tick()
-                            onPauseDownload(st.spec.id)
-                        },
-                        onCancel = {
-                            haptics.tick()
-                            onCancelDownload(st.spec.id)
-                        },
-                        onImport = {
-                            haptics.click()
-                            onImportModel(st.spec.id)
-                        },
-                        onSelectPresetForModel = {
-                            haptics.tick()
-                            val presets = TinyAsrCatalog.PRESETS.filter { it.modelId == st.spec.id }
-                            if (presets.size == 1) {
-                                onSelectPreset(presets.first().id)
-                            } else if (presets.isNotEmpty()) {
-                                presetPickerModel = st.spec
+                item(key = "filters-help") {
+                    Text(
+                        if (russian) "Чтобы очистить файл, нажмите «Фильтры» в плеере записи."
+                        else "To clean an audio file, tap Filters in the recording player.",
+                        color = colors.textSecondary,
+                        style = VantaType.bodySmall
+                    )
+                }
+                item(key = "built-in") {
+                    val guide = AudioTreatment.QUICK_CLEANUP.guide(russian)
+                    CatalogCard(
+                        title = guide.title,
+                        state = if (russian) "Встроено · ${guide.model}" else "Built in · ${guide.model}",
+                        description = guide.description
+                    )
+                }
+            }
+
+            val rows = if (category == ModelCategory.SPEECH) shownSpeech
+            else AudioTreatment.entries.mapNotNull { statusesById[it.modelId] }
+            items(rows, key = { it.spec.id }) { status ->
+                val spec = status.spec
+                val treatment = AudioTreatment.forModel(spec.id)
+                val guide = treatment?.guide(russian)
+                val ready = spec.bundledInApk || status.isInstalled
+                val active = preset.modelId == spec.id
+                val fileOnly = spec.id == TinyAsrCatalog.GIGAAM
+                val title = guide?.title ?: if (spec.id == TinyAsrCatalog.GIGAAM_V4) "GigaAM v4" else spec.localizedTitle(strings)
+                val hasTransfer = status.downloadProgress?.phase?.let { it != ModelDownloadPhase.IDLE } == true
+                val recommendation = when {
+                    treatment == AudioTreatment.DEEP_FILTER_3 -> if (russian) "Для начала" else "Start here"
+                    spec.id == "en-ru-uk" -> if (russian) "Рекомендуется" else "Recommended"
+                    else -> null
+                }
+                val readiness = when {
+                    spec.bundledInApk -> if (russian) "Встроено" else "Built in"
+                    status.isInstalled -> if (russian) "Скачано" else "Downloaded"
+                    status.isIncomplete -> null
+                    hasTransfer -> null
+                    else -> if (russian) "Нужно скачать" else "Download needed"
+                }
+                val tags = listOfNotNull(
+                    readiness,
+                    if (active) (if (russian) "Выбрана" else "Selected") else null,
+                    recommendation,
+                    guide?.model,
+                    if (!ready && !hasTransfer) formatStorageSize(spec.expectedTotalBytes) else null
+                )
+                CatalogCard(
+                    title = title,
+                    state = tags.joinToString(" · "),
+                    description = guide?.description ?: speechSummary(spec, russian),
+                    menu = {
+                        var expanded by remember { mutableStateOf(false) }
+                        Box {
+                            VantaIconButton(
+                                icon = Icons.Rounded.MoreVert,
+                                contentDescription = if (russian) "Действия для $title" else "Actions for $title",
+                                onClick = { expanded = true }
+                            )
+                            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                                DropdownMenuItem(
+                                    text = { Text(if (russian) "Как пользоваться" else "How to use") },
+                                    onClick = { expanded = false; details = spec }
+                                )
+                                if (status.updateAvailable && !hasTransfer) DropdownMenuItem(
+                                    text = { Text(strings.modelUpdateButton) },
+                                    onClick = { expanded = false; onDownloadModel(spec.id) }
+                                )
+                                if (!spec.isOnnxModel && !hasTransfer) DropdownMenuItem(
+                                    text = { Text(strings.modelImportButton) },
+                                    onClick = { expanded = false; onImportModel(spec.id) }
+                                )
+                                if (status.isInstalled && !hasTransfer) DropdownMenuItem(
+                                    text = { Text(strings.modelDeleteButton) },
+                                    onClick = { expanded = false; delete = spec }
+                                )
                             }
-                        },
-                        onRequestDelete = {
-                            haptics.heavy()
-                            deleteConfirmModel = st
-                        },
-                        modifier = Modifier.animateItem()
-                    )
-                }
-            }
-
-            item(key = "nav_spacer") {
-                Spacer(Modifier.navigationBarsPadding())
-            }
-        }
-
-        // Preset picker sheet for installed model
-        presetPickerModel?.let { spec ->
-            val modelPresets = remember(spec.id) { TinyAsrCatalog.PRESETS.filter { it.modelId == spec.id } }
-            VantaBottomSheet(
-                onDismissRequest = { presetPickerModel = null },
-                title = spec.localizedTitle(s),
-                headerIcon = Icons.Rounded.Translate
-            ) {
-                for (preset in modelPresets) {
-                    SheetOptionRow(
-                        selected = preset.id == activePresetId,
-                        title = preset.label(s),
-                        subtitle = preset.shortLabel,
-                        onClick = {
-                            haptics.confirm()
-                            onSelectPreset(preset.id)
-                            presetPickerModel = null
                         }
+                    }
+                ) {
+                    val transfer = status.downloadProgress
+                    if (transfer != null && transfer.phase != ModelDownloadPhase.IDLE) {
+                        ModelTransferControls(
+                            transfer, onResume = { onDownloadModel(spec.id) },
+                            onPause = { onPauseDownload(spec.id) }, onCancel = { onCancelDownload(spec.id) }
+                        )
+                    } else if (!ready) {
+                        VantaPrimaryButton(
+                            label = if (status.isIncomplete) strings.modelResumeButton else strings.modelDownloadButton,
+                            onClick = { onDownloadModel(spec.id) }
+                        )
+                    } else if (treatment != null || fileOnly) {
+                        TextButton(onClick = { details = spec }) {
+                            Text(if (russian) "Как применить" else "How to use", color = colors.accent)
+                        }
+                    } else {
+                        val presets = TinyAsrCatalog.PRESETS.filter { it.modelId == spec.id }
+                        if (presets.size > 1 || !active) VantaTonalButton(
+                            label = if (presets.size > 1) {
+                                if (russian) "Выбрать язык" else "Choose language"
+                            } else {
+                                if (russian) "Использовать офлайн" else "Use offline"
+                            },
+                            onClick = {
+                                if (presets.size == 1) onSelectPreset(presets.single().id)
+                                else languagePicker = spec
+                            }
+                        )
+                    }
+                }
+            }
+
+            if (category == ModelCategory.FILTERS) {
+                item(key = "recognition-settings") {
+                    TextButton(onClick = { showRecognitionFilter = true }) {
+                        Text(
+                            if (russian) "Настроить шумоподавление для текста" else "Configure noise filter for transcription",
+                            color = colors.accent
+                        )
+                    }
+                }
+            }
+        }
+
+        if (showRecognitionFilter) RecognitionFilterSheet(
+            current = recognitionFilter,
+            russian = russian,
+            onChoose = { filter -> onSelectRecognitionFilter(filter); showRecognitionFilter = false },
+            onDismiss = { showRecognitionFilter = false }
+        )
+        languagePicker?.let { spec ->
+            VantaBottomSheet(
+                onDismissRequest = { languagePicker = null },
+                title = if (russian) "Язык распознавания" else "Transcription language"
+            ) {
+                Column(Modifier.heightIn(max = 440.dp).verticalScroll(rememberScrollState())) {
+                    TinyAsrCatalog.PRESETS.filter { it.modelId == spec.id }.forEach { choice ->
+                        SheetOptionRow(
+                            selected = choice.id == activePresetId,
+                            title = choice.label(strings),
+                            onClick = { onSelectPreset(choice.id); languagePicker = null }
+                        )
+                    }
+                }
+            }
+        }
+
+        details?.let { spec ->
+            val guide = AudioTreatment.forModel(spec.id)?.guide(russian)
+            val status = statusesById[spec.id]
+            val ready = spec.bundledInApk || status?.isInstalled == true
+            val instructions = when {
+                guide != null -> if (russian) "В плеере записи откройте «Фильтры» → «${guide.title}». Сравните фрагмент, затем примените фильтр."
+                    else "In the recording player, choose Filters → ${guide.title}. Compare a sample, then apply the filter."
+                spec.id == TinyAsrCatalog.GIGAAM -> if (russian) "Откройте сохранённую запись → Распознать заново → GigaAM v3."
+                    else "Open a saved recording → Retranscribe → GigaAM v3."
+                else -> if (russian) "Выберите модель или язык в этом каталоге. Выбор применяется к следующей офлайн-записи."
+                    else "Select the model or language here. The choice applies to the next offline recording."
+            }
+            VantaBottomSheet(
+                onDismissRequest = { details = null },
+                title = guide?.title ?: spec.localizedTitle(strings)
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(Spacing.sm)) {
+                    if (!ready) Text(
+                        (if (russian) "Сначала скачайте модель" else "Download the model first") + " · " +
+                            formatStorageSize(spec.expectedTotalBytes),
+                        color = colors.textSecondary, style = VantaType.bodySmall
+                    )
+                    Text(instructions, color = colors.textPrimary, style = VantaType.body)
+                    Text(
+                        listOfNotNull(guide?.model, status?.installedFormat ?: spec.formatVersion).joinToString(" · "),
+                        color = colors.textSecondary, style = VantaType.bodySmall
                     )
                 }
             }
         }
 
-        deleteConfirmModel?.let { st ->
+        delete?.let { spec ->
             VantaDialog(
-                onDismissRequest = { deleteConfirmModel = null },
-                title = s.modelDeleteTitle,
+                onDismissRequest = { delete = null },
+                title = strings.modelDeleteTitle,
                 icon = Icons.Rounded.DeleteOutline,
-                iconTint = colors.destructive,
-                iconContainerColor = colors.destructiveSoft,
-                highlightText = st.spec.localizedTitle(s),
-                message = s.modelDeleteMessage,
-                confirmLabel = s.modelDeleteButton,
+                message = strings.modelDeleteMessage,
+                highlightText = spec.localizedTitle(strings),
+                confirmLabel = strings.modelDeleteButton,
+                dismissLabel = strings.cancel,
                 isDestructive = true,
-                onConfirm = {
-                    haptics.heavy()
-                    onDeleteModel(st.spec.id)
-                    deleteConfirmModel = null
-                },
-                dismissLabel = s.cancel,
-                onDismiss = { deleteConfirmModel = null }
+                onConfirm = { onDeleteModel(spec.id); delete = null },
+                onDismiss = { delete = null }
             )
         }
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ModelCatalogCard(
-    status: ModelInstallStatus,
-    isActiveModel: Boolean,
-    strings: AppStrings,
-    onDownload: () -> Unit,
-    onPause: () -> Unit,
-    onCancel: () -> Unit,
-    onImport: () -> Unit,
-    onSelectPresetForModel: () -> Unit,
-    onRequestDelete: () -> Unit,
-    modifier: Modifier = Modifier
+private fun ModelTab(label: String, selected: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    val colors = LocalStenografColors.current
+    VantaTonalButton(
+        label = label, modifier = modifier, onClick = onClick,
+        containerColor = if (selected) colors.accentSoft else colors.surfaceElevated,
+        contentColor = if (selected) colors.accent else colors.textSecondary,
+        borderColor = if (selected) colors.accent else colors.border
+    )
+}
+
+@Composable
+private fun CatalogCard(
+    title: String,
+    state: String,
+    description: String,
+    menu: (@Composable () -> Unit)? = null,
+    action: @Composable () -> Unit = {}
 ) {
     val colors = LocalStenografColors.current
-    val extra = LocalExtraStrings.current
-    val spec = status.spec
-    val dl = status.downloadProgress
-    var langsExpanded by remember(spec.id) { mutableStateOf(false) }
-
     Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .vantaSurfaceCard(colors, radius = Radius.lg, elevated = false)
-            .animateContentSize(animationSpec = Motion.mediumTween())
-            .padding(Spacing.lg),
-        verticalArrangement = Arrangement.spacedBy(Spacing.sm)
+        modifier = Modifier.fillMaxWidth()
+            .vantaSurfaceCard(colors, radius = Radius.md, elevated = false)
+            .padding(Spacing.md),
+        verticalArrangement = Arrangement.spacedBy(Spacing.xs)
     ) {
-        // Title + Status pill
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.Top,
-            horizontalArrangement = Arrangement.spacedBy(Spacing.sm)
+            modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Spacing.xs)
         ) {
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Text(
-                    text = spec.localizedTitle(strings),
-                    color = colors.textPrimary,
-                    style = VantaType.cardTitle,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
-
-                val sizeText = if (status.isInstalled && status.sizeBytes > 0L) {
-                    formatStorageSize(status.sizeBytes)
-                } else {
-                    String.format(Locale.US, "%.1f MB", spec.sizeMb)
-                }
-                val fmtLabel = status.installedFormat ?: spec.formatVersion
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
-                    verticalArrangement = Arrangement.spacedBy(Spacing.xxs)
-                ) {
-                    MetaTagBadge(text = spec.id)
-                    MetaTagBadge(text = fmtLabel)
-                    MetaTagBadge(text = sizeText)
-                }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(Spacing.xxs)) {
+                Text(title, color = colors.textPrimary, style = VantaType.cardTitle)
+                if (state.isNotBlank()) Text(state, color = colors.textSecondary, style = VantaType.bodySmall)
             }
-
-            when {
-                dl?.phase == ModelDownloadPhase.DOWNLOADING -> StatusPill(
-                    label = strings.modelDownloadingLabel,
-                    dotColor = colors.accent,
-                    containerColor = colors.accentSoft,
-                    contentColor = colors.accent
-                )
-                dl?.phase == ModelDownloadPhase.VERIFYING -> StatusPill(
-                    label = strings.modelVerifyingLabel,
-                    dotColor = colors.accent,
-                    containerColor = colors.accentSoft,
-                    contentColor = colors.accent
-                )
-                dl?.phase == ModelDownloadPhase.PAUSED -> StatusPill(
-                    label = strings.modelPausedLabel,
-                    dotColor = colors.warning,
-                    containerColor = colors.warningSoft,
-                    contentColor = colors.warning
-                )
-                status.updateAvailable -> StatusPill(
-                    label = strings.modelUpdateButton,
-                    dotColor = colors.warning,
-                    containerColor = colors.warningSoft,
-                    contentColor = colors.warning
-                )
-                status.isInstalled -> StatusPill(
-                    label = if (spec.bundledInApk) strings.modelBuiltInLabel else strings.modelInstalledLabel,
-                    dotColor = colors.success,
-                    containerColor = colors.successSoft,
-                    contentColor = colors.success
-                )
-                else -> StatusPill(label = strings.modelAvailableLabel)
-            }
+            menu?.invoke()
         }
-
-        // Expandable Supported ASR Language Chips
-        val displayedLangs = if (langsExpanded) spec.languages else spec.languages.take(6)
-        FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(Spacing.xs),
-            verticalArrangement = Arrangement.spacedBy(Spacing.xs)
-        ) {
-            for (langCode in displayedLangs) {
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(Radius.xs))
-                        .background(colors.surfaceElevated)
-                        .padding(horizontal = Spacing.sm, vertical = 4.dp)
-                ) {
-                    Text(
-                        text = TinyAsrCatalog.languageNativeName(langCode),
-                        color = colors.textSecondary,
-                        style = VantaType.bodySmall,
-                        maxLines = 1
-                    )
-                }
-            }
-            if (!langsExpanded && spec.languages.size > 6) {
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(Radius.xs))
-                        .background(colors.accentSoft)
-                        .clickable { langsExpanded = true }
-                        .padding(horizontal = Spacing.sm, vertical = 4.dp)
-                ) {
-                    Text(
-                        text = "+${spec.languages.size - 6}",
-                        color = colors.accent,
-                        style = VantaType.monoBadge
-                    )
-                }
-            }
-        }
-
-        // Active transfer / pause / error progress block
-        if (dl != null) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(Radius.md))
-                    .background(colors.surfaceRecessed)
-                    .border(0.75.dp, colors.border, RoundedCornerShape(Radius.md))
-                    .padding(Spacing.md),
-                verticalArrangement = Arrangement.spacedBy(Spacing.xs)
-            ) {
-                if (dl.phase == ModelDownloadPhase.VERIFYING) {
-                    VantaLinearProgressTrack(progress = null)
-                    Text(strings.modelVerifyingLabel, color = colors.textSecondary, style = VantaType.bodySmall)
-                } else {
-                    VantaLinearProgressTrack(
-                        progress = dl.fraction,
-                        fillColor = if (dl.phase == ModelDownloadPhase.ERROR) colors.destructive else colors.accent
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "${formatStorageSize(dl.downloadedBytes)} / ${formatStorageSize(dl.totalBytes)}",
-                            color = colors.textSecondary,
-                            style = VantaType.monoMetric
-                        )
-                        val speedStr = formatTransferSpeed(dl.speedBytesPerSec)
-                        val etaStr = formatEtaDuration(dl.etaSeconds)
-                        val meta = listOf(speedStr, etaStr).filter { it.isNotEmpty() }.joinToString(" · ")
-                        if (meta.isNotEmpty()) {
-                            Text(
-                                text = meta,
-                                color = colors.accent,
-                                style = VantaType.monoMetric
-                            )
-                        }
-                    }
-                    if (!dl.errorMessage.isNullOrBlank()) {
-                        Text(
-                            text = dl.errorMessage,
-                            color = colors.destructive,
-                            style = VantaType.bodySmall,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
-            }
-        }
-
-        // Action row
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(Spacing.sm),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            when {
-                dl?.phase == ModelDownloadPhase.DOWNLOADING -> {
-                    VantaTonalButton(
-                        label = strings.modelPauseButton,
-                        icon = Icons.Rounded.Pause,
-                        onClick = onPause,
-                        modifier = Modifier.weight(1f)
-                    )
-                    VantaIconButton(
-                        icon = Icons.Rounded.Close,
-                        contentDescription = strings.cancel,
-                        tint = colors.destructive,
-                        containerColor = colors.destructiveSoft,
-                        onClick = onCancel
-                    )
-                }
-                dl?.phase == ModelDownloadPhase.PAUSED || dl?.phase == ModelDownloadPhase.ERROR -> {
-                    VantaPrimaryButton(
-                        label = if (dl.phase == ModelDownloadPhase.ERROR) strings.retry else strings.modelResumeButton,
-                        icon = Icons.Rounded.PlayArrow,
-                        onClick = onDownload,
-                        modifier = Modifier.weight(1f)
-                    )
-                    VantaIconButton(
-                        icon = Icons.Rounded.Close,
-                        contentDescription = strings.cancel,
-                        tint = colors.textMuted,
-                        containerColor = colors.surfaceElevated,
-                        onClick = onCancel
-                    )
-                }
-                dl?.phase == ModelDownloadPhase.VERIFYING -> {
-                    Spacer(Modifier.weight(1f))
-                }
-                else -> {
-                    if (!status.isInstalled || status.updateAvailable) {
-                        VantaPrimaryButton(
-                            label = if (status.updateAvailable) strings.modelUpdateButton else strings.modelDownloadButton,
-                            icon = Icons.Rounded.Download,
-                            containerColor = if (status.updateAvailable) colors.warning else colors.accent,
-                            contentColor = if (status.updateAvailable) colors.onWarning else colors.onAccent,
-                            onClick = onDownload,
-                            modifier = Modifier.weight(1f)
-                        )
-                        VantaTonalButton(
-                            label = strings.modelImportButton,
-                            icon = Icons.Rounded.FileUpload,
-                            onClick = onImport
-                        )
-                    } else {
-                        VantaTonalButton(
-                            label = extra.selectPresetAction,
-                            icon = if (isActiveModel) Icons.Rounded.CheckCircle else Icons.Rounded.Translate,
-                            containerColor = if (isActiveModel) colors.accentSoft else colors.surfaceElevated,
-                            contentColor = if (isActiveModel) colors.accent else colors.textPrimary,
-                            borderColor = if (isActiveModel) colors.accent.copy(alpha = 0.4f) else colors.borderStrong,
-                            onClick = onSelectPresetForModel,
-                            modifier = Modifier.weight(1f)
-                        )
-                        VantaIconButton(
-                            icon = Icons.Rounded.FileUpload,
-                            contentDescription = strings.modelImportButton,
-                            tint = colors.textPrimary,
-                            containerColor = colors.surfaceElevated,
-                            size = 46.dp,
-                            onClick = onImport
-                        )
-                    }
-
-                    if (status.isInstalled) {
-                        VantaIconButton(
-                            icon = Icons.Rounded.DeleteOutline,
-                            contentDescription = strings.modelDeleteButton,
-                            tint = colors.destructive,
-                            containerColor = colors.destructiveSoft,
-                            size = 46.dp,
-                            onClick = onRequestDelete
-                        )
-                    }
-                }
-            }
-        }
+        Text(description, color = colors.textPrimary, style = VantaType.bodySmall)
+        action()
     }
 }
 
 @Composable
-private fun MetaTagBadge(text: String) {
+internal fun ModelTransferControls(
+    transfer: ModelDownloadProgress, onResume: () -> Unit, onPause: () -> Unit, onCancel: () -> Unit
+) {
+    val strings = LocalStrings.current
     val colors = LocalStenografColors.current
-    val shape = RoundedCornerShape(Radius.xs)
-    Box(
-        modifier = Modifier
-            .clip(shape)
-            .background(colors.surfaceRecessed)
-            .border(0.5.dp, colors.border, shape)
-            .padding(horizontal = 7.dp, vertical = 2.dp)
-    ) {
+    val verifying = transfer.phase == ModelDownloadPhase.VERIFYING
+    val canPause = transfer.phase == ModelDownloadPhase.DOWNLOADING
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(Spacing.xs)) {
+        VantaLinearProgressTrack(progress = transfer.fraction.takeUnless { verifying || transfer.totalBytes <= 0L })
         Text(
-            text = text,
-            color = colors.textSecondary,
-            style = VantaType.monoBadge
+            if (verifying) strings.modelVerifyingLabel
+            else "${formatStorageSize(transfer.downloadedBytes)} / ${formatStorageSize(transfer.totalBytes)}",
+            color = colors.textSecondary, style = VantaType.bodySmall
         )
+        transfer.errorMessage?.takeIf { it.isNotBlank() }?.let { message ->
+            Text(message, color = colors.destructive, style = VantaType.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(Spacing.xs)
+        ) {
+            if (!verifying) VantaTonalButton(
+                label = when {
+                    canPause -> strings.modelPauseButton
+                    transfer.phase == ModelDownloadPhase.ERROR -> strings.retry
+                    else -> strings.modelResumeButton
+                },
+                onClick = if (canPause) onPause else onResume
+            )
+            VantaIconButton(icon = Icons.Rounded.Close, contentDescription = strings.cancel, onClick = onCancel)
+        }
     }
+}
+
+private fun speechSummary(spec: TinyAsrModelSpec, russian: Boolean): String = when (spec.id) {
+    "en-ru-uk" -> if (russian) "Быстрый старт для русского, английского и украинского. Подходит для лекций и заметок."
+        else "Quick start for Russian, English and Ukrainian lectures and notes."
+    "fr-de" -> if (russian) "Для французской и немецкой речи. Можно начать сразу." else "For French and German speech. Ready to use."
+    TinyAsrCatalog.GIGAAM_V4 -> if (russian) "Для русской и английской речи. Работает в записи и с файлами, занимает больше места."
+        else "For Russian and English, live or from files. Uses more storage."
+    TinyAsrCatalog.GIGAAM -> if (russian) "Вариант для повторной расшифровки русской речи в сохранённом файле."
+        else "An alternative for retranscribing Russian speech in a saved file."
+    "en-es-it-pt" -> if (russian) "Одна модель для английского, испанского, итальянского и португальского."
+        else "One model for English, Spanish, Italian and Portuguese speech."
+    "zh" -> if (russian) "Китайская речь с выбором упрощённого или традиционного письма."
+        else "Chinese speech with a choice of simplified or traditional writing."
+    "ar" -> if (russian) "Для арабской речи, включая разговорные диалекты." else "For Arabic speech, including spoken dialects."
+    "uz" -> if (russian) "Узбекская речь с выбором латиницы или кириллицы." else "Uzbek speech in Latin or Cyrillic script."
+    "en-fa" -> if (russian) "Для персидской речи, в том числе с английскими вставками." else "For Persian speech, including English phrases."
+    "en-km" -> if (russian) "Для кхмерской речи, в том числе с английскими вставками." else "For Khmer speech, including English phrases."
+    "id-ms" -> if (russian) "Для индонезийской и малайской речи." else "For Indonesian and Malay speech."
+    else -> spec.languages.joinToString(" · ", transform = TinyAsrCatalog::languageNativeName)
 }

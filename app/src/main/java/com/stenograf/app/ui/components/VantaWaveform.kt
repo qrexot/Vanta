@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
@@ -59,7 +60,7 @@ internal fun LiveWaveformView(
     waveform: Flow<List<Float>>,
     isActive: Boolean,
     isPaused: Boolean,
-    modifier: Modifier = Modifier.height(52.dp)
+    modifier: Modifier = Modifier
 ) {
     val colors = LocalStenografColors.current
     val amplitudes by waveform.collectAsStateWithLifecycle(initialValue = emptyList())
@@ -87,7 +88,7 @@ internal fun LiveWaveformView(
     )
     val baselineColor = colors.border
 
-    Canvas(modifier = modifier.fillMaxWidth()) {
+    Canvas(modifier = modifier.fillMaxWidth().heightIn(min = 36.dp)) {
         val currentFrame = frame
         val count = currentFrame.end.size
         val step = size.width / count.coerceAtLeast(1)

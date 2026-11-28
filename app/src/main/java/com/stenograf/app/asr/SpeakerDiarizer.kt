@@ -12,10 +12,14 @@ import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
 import java.io.Closeable
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import kotlin.math.sqrt
 
-internal class SpeakerDiarizer(assets: AssetManager, private val label: String) : Closeable {
-    private val embeddingConfig = SpeakerEmbeddingExtractorConfig(model = "models/campplus.onnx")
+internal class SpeakerDiarizer(
+    assets: AssetManager,
+    private val label: String,
+    private val autoVoicePrefix: String = label,
+    private val autoLearnSpeakers: Boolean = false
+) : Closeable {
+    private val embeddingConfig = SpeakerEmbeddingExtractorConfig(model = VoiceprintMath.EMBEDDING_MODEL_ASSET)
     private val diarization = OfflineSpeakerDiarization(
         assets,
         OfflineSpeakerDiarizationConfig(
@@ -40,12 +44,26 @@ internal class SpeakerDiarizer(assets: AssetManager, private val label: String) 
     }
 
     private data class Profile(
+        val id: Long?,
         val name: String,
         val vector: FloatArray,
         val observations: Int,
-        val samples: List<FloatArray> = listOf(vector)
+        val samples: List<FloatArray> = listOf(vector),
+        val persistent: Boolean = false,
+        val isAutoLearned: Boolean = false,
+        val dirty: Boolean = false,
+        val persistAsName: String? = null,
+        val accumulatedCleanSeconds: Float = 0f,
+        val dirtyAddedSeconds: Float = 0f,
+        val previewPcm16: ByteArray? = null
     )
-    private data class Voice(val localId: Int, val vector: FloatArray?, val cleanSeconds: Float)
+
+    private data class Voice(
+        val localId: Int,
+        val vector: FloatArray?,
+        val cleanSeconds: Float,
+        val cleanSamples: FloatArray
+    )
     private data class LabeledTurn(val start: Float, val end: Float, val name: String)
     private data class Match(val localId: Int, val name: String, val score: Float)
 
@@ -54,13 +72,82 @@ internal class SpeakerDiarizer(assets: AssetManager, private val label: String) 
     private var contextTurns = emptyList<LabeledTurn>()
     private val profiles = mutableListOf<Profile>()
     private var nextSpeaker = 1
+    private var nextAutoVoiceIndex = 1
+    private var autoEnrolledThisSession = 0
+
+    fun seedStoredProfiles(stored: List<StoredVoiceprint>) {
+        val hashPrefix = "$autoVoicePrefix #"
+        for (item in stored) {
+            if (item.name.startsWith(hashPrefix)) {
+                item.name.removePrefix(hashPrefix).toIntOrNull()?.let { n ->
+                    nextAutoVoiceIndex = maxOf(nextAutoVoiceIndex, n + 1)
+                }
+            }
+            if (profiles.none { it.name.equals(item.name, ignoreCase = true) }) {
+                profiles.add(
+                    Profile(
+                        id = item.id,
+                        name = item.name,
+                        vector = item.centroid,
+                        observations = item.sampleCount.coerceAtLeast(1),
+                        samples = item.prototypes.ifEmpty { listOf(item.centroid) },
+                        persistent = true,
+                        isAutoLearned = item.isAutoLearned,
+                        dirty = false
+                    )
+                )
+            }
+        }
+    }
+
+    fun drainLearnedUpdates(): List<LearnedVoiceprintUpdate> {
+        if (!autoLearnSpeakers) return emptyList()
+        val updates = mutableListOf<LearnedVoiceprintUpdate>()
+        for (i in profiles.indices) {
+            val p = profiles[i]
+            if (p.persistent && p.dirty) {
+                updates.add(
+                    LearnedVoiceprintUpdate(
+                        profileId = p.id,
+                        name = p.persistAsName ?: p.name,
+                        centroid = p.vector,
+                        prototypes = p.samples,
+                        sampleCount = p.observations,
+                        isAutoLearned = p.isAutoLearned,
+                        addedSpeechSeconds = p.dirtyAddedSeconds,
+                        samplePcm16 = p.previewPcm16
+                    )
+                )
+                profiles[i] = p.copy(dirty = false, dirtyAddedSeconds = 0f, previewPcm16 = null)
+            }
+        }
+        return updates
+    }
 
     fun seed(name: String, pcm: ByteArray) {
-        nextSpeaker = maxOf(nextSpeaker, (name.substringAfterLast(' ').toIntOrNull() ?: 0) + 1)
-        val vector = embed(toSamples(pcm)) ?: return
+        if (name.startsWith("$label ")) {
+            nextSpeaker = maxOf(nextSpeaker, (name.substringAfterLast(' ').toIntOrNull() ?: 0) + 1)
+        }
+        val samples = toSamples(pcm)
+        val vector = embed(samples) ?: return
+        val durationSec = samples.size / SAMPLE_RATE.toFloat()
         val index = profiles.indexOfFirst { it.name == name }
-        if (index < 0) profiles.add(Profile(name, vector, 1))
-        else if (similarity(profiles[index], vector) >= 0.62f) updateProfile(index, vector)
+        if (index < 0) {
+            profiles.add(
+                Profile(
+                    id = null,
+                    name = name,
+                    vector = vector,
+                    observations = 1,
+                    accumulatedCleanSeconds = durationSec
+                )
+            )
+        } else {
+            val existing = profiles[index]
+            if ((!existing.persistent || autoLearnSpeakers) && similarity(existing, vector) >= 0.62f) {
+                updateProfile(index, vector, durationSec)
+            }
+        }
     }
 
     fun analyze(pcm: ByteArray, offsetBytes: Long, cancelled: () -> Boolean): SpeakerTimeline {
@@ -77,14 +164,13 @@ internal class SpeakerDiarizer(assets: AssetManager, private val label: String) 
         val voices = grouped.map { (id, localTurns) ->
             if (cancelled()) return SpeakerTimeline.Empty
             val clean = cleanVoice(samples, localTurns, turns)
-            Voice(id, embed(clean), clean.size / SAMPLE_RATE.toFloat())
+            Voice(id, embed(clean), clean.size / SAMPLE_RATE.toFloat(), clean)
         }
         val labels = mutableMapOf<Int, String>()
         val usedNames = mutableSetOf<String>()
         val availableLabels = profiles.map { it.name }.toSet()
 
-        // The same audio appears in both windows. Its timing is stronger evidence
-        // than comparing embeddings for short or quiet turns.
+        // Overlap across sliding windows gives reliable continuity even for short turns.
         val anchored = grouped.flatMap { (id, localTurns) ->
             anchors.groupBy { it.name }.mapNotNull { (name, prior) ->
                 val shared = localTurns.sumOf { current ->
@@ -97,15 +183,31 @@ internal class SpeakerDiarizer(assets: AssetManager, private val label: String) 
             if (match.localId !in labels && usedNames.add(match.name)) labels[match.localId] = match.name
         }
 
-        val matches = voices.flatMap { voice ->
-            val vector = voice.vector ?: return@flatMap emptyList()
-            profiles.map { Match(voice.localId, it.name, similarity(it, vector)) }
-        }.groupBy { it.localId }.mapValues { (_, values) -> values.sortedByDescending { it.score } }
-        for (match in matches.values.mapNotNull { it.firstOrNull() }.sortedByDescending { it.score }) {
-            val alternative = matches.getValue(match.localId).getOrNull(1)?.score ?: -1f
-            val stableSingleVoice = profiles.size == 1 && voices.size == 1 && match.score >= 0.55f
-            if (match.localId !in labels && (match.score >= 0.61f || stableSingleVoice) &&
-                (match.score >= 0.8f || match.score - alternative >= 0.055f) && usedNames.add(match.name)
+        val rankedByCluster = voices.associate { voice ->
+            val vector = voice.vector
+            val ranked = if (vector == null) emptyList() else {
+                profiles.map { Match(voice.localId, it.name, similarity(it, vector)) }
+                    .sortedByDescending { it.score }
+            }
+            voice.localId to ranked
+        }
+        val matchCandidates = rankedByCluster.values.mapNotNull { it.firstOrNull() }.sortedByDescending { it.score }
+        val persistentCount = profiles.count { it.persistent }
+        val sessionCount = profiles.size - persistentCount
+
+        for (match in matchCandidates) {
+            val ranked = rankedByCluster.getValue(match.localId)
+            val alternative = ranked.getOrNull(1)?.score ?: -1f
+            val targetProfile = profiles.firstOrNull { it.name == match.name } ?: continue
+            val stableSingleSessionVoice = !targetProfile.persistent && sessionCount <= 1 && persistentCount == 0 &&
+                voices.size == 1 && match.score >= 0.55f
+            val scoreThreshold = if (targetProfile.persistent) 0.57f else 0.60f
+            val hasClearMargin = match.score >= 0.78f || (match.score - alternative) >= 0.055f
+
+            if (match.localId !in labels &&
+                (match.score >= scoreThreshold || stableSingleSessionVoice) &&
+                hasClearMargin &&
+                usedNames.add(match.name)
             ) {
                 labels[match.localId] = match.name
             }
@@ -117,15 +219,87 @@ internal class SpeakerDiarizer(assets: AssetManager, private val label: String) 
             val name = labels[voice.localId]
             if (name == null) {
                 val best = profiles.maxOfOrNull { similarity(it, vector) } ?: -1f
-                val enoughSpeech = voice.cleanSeconds >= if (profiles.isEmpty()) 0.75f else 1.2f
-                if (enoughSpeech && best < 0.52f && profiles.size < 24) {
-                    val newName = "$label ${nextSpeaker++}"
-                    profiles.add(Profile(newName, vector, 1))
-                    labels[voice.localId] = newName
+                if (autoLearnSpeakers &&
+                    voice.cleanSeconds >= 2.6f &&
+                    best < 0.45f &&
+                    profiles.size < 48 &&
+                    autoEnrolledThisSession < 4
+                ) {
+                    val autoName = "$autoVoicePrefix #${nextAutoVoiceIndex++}"
+                    autoEnrolledThisSession++
+                    profiles.add(
+                        Profile(
+                            id = null,
+                            name = autoName,
+                            vector = vector,
+                            observations = 1,
+                            samples = listOf(vector),
+                            persistent = true,
+                            isAutoLearned = true,
+                            dirty = true,
+                            accumulatedCleanSeconds = voice.cleanSeconds,
+                            dirtyAddedSeconds = voice.cleanSeconds,
+                            previewPcm16 = SpeakerEmbeddingHelper.floatSamplesToPcm16Bytes(voice.cleanSamples)
+                        )
+                    )
+                    labels[voice.localId] = autoName
+                } else {
+                    val enoughSpeech = voice.cleanSeconds >= if (profiles.none { !it.persistent }) 0.75f else 1.2f
+                    if (enoughSpeech && best < 0.52f && profiles.size < 48) {
+                        val newName = "$label ${nextSpeaker++}"
+                        profiles.add(
+                            Profile(
+                                id = null,
+                                name = newName,
+                                vector = vector,
+                                observations = 1,
+                                accumulatedCleanSeconds = voice.cleanSeconds
+                            )
+                        )
+                        labels[voice.localId] = newName
+                    }
                 }
-            } else if (voice.cleanSeconds >= 1.2f) {
+            } else {
                 val index = profiles.indexOfFirst { it.name == name }
-                if (similarity(profiles[index], vector) >= 0.69f) updateProfile(index, vector)
+                if (index >= 0) {
+                    val profile = profiles[index]
+                    val ranked = rankedByCluster[voice.localId].orEmpty()
+                    val sim = ranked.firstOrNull { it.name == name }?.score ?: similarity(profile, vector)
+                    val alternative = ranked.firstOrNull { it.name != name }?.score ?: -1f
+                    val margin = sim - alternative
+                    if (profile.persistent) {
+                        val strictHighMatch = voice.cleanSeconds >= 1.8f && sim >= 0.69f && margin >= 0.08f
+                        val crossEnvAdaptation = voice.cleanSeconds >= 2.6f && sim >= 0.58f && margin >= 0.14f
+                        if (autoLearnSpeakers && (strictHighMatch || crossEnvAdaptation)) {
+                            val clip = if (profile.isAutoLearned && profile.previewPcm16 == null && voice.cleanSeconds >= 2.6f) {
+                                SpeakerEmbeddingHelper.floatSamplesToPcm16Bytes(voice.cleanSamples)
+                            } else null
+                            updateProfile(index, vector, voice.cleanSeconds, clip)
+                        }
+                    } else if (voice.cleanSeconds >= 1.1f && sim >= 0.67f) {
+                        updateProfile(index, vector, voice.cleanSeconds)
+                        // Promote consistent multi-window session speakers to persistent store for future recordings
+                        // while preserving their current-session transcript label so paragraphs never split mid-file.
+                        val promoted = profiles[index]
+                        if (autoLearnSpeakers &&
+                            !promoted.persistent &&
+                            promoted.observations >= 2 &&
+                            promoted.accumulatedCleanSeconds >= 3.2f &&
+                            autoEnrolledThisSession < 4
+                        ) {
+                            autoEnrolledThisSession++
+                            profiles[index] = promoted.copy(
+                                persistent = true,
+                                isAutoLearned = true,
+                                dirty = true,
+                                persistAsName = "$autoVoicePrefix #${nextAutoVoiceIndex++}",
+                                dirtyAddedSeconds = promoted.accumulatedCleanSeconds,
+                                previewPcm16 = promoted.previewPcm16
+                                    ?: SpeakerEmbeddingHelper.floatSamplesToPcm16Bytes(voice.cleanSamples)
+                            )
+                        }
+                    }
+                }
             }
         }
 
@@ -164,30 +338,47 @@ internal class SpeakerDiarizer(assets: AssetManager, private val label: String) 
         val best = ranked.firstOrNull()
         val secondScore = ranked.getOrNull(1)?.second ?: -1f
         val originalScore = ranked.firstOrNull { it.first == clusterLabel }?.second ?: -1f
-        if (best != null && best.second >= 0.68f && best.second - secondScore >= 0.07f &&
+        val minScore = if (clusterLabel == null) 0.64f else 0.68f
+        if (best != null && best.second >= minScore && best.second - secondScore >= 0.06f &&
             (clusterLabel == null || best.second - originalScore >= 0.13f)
         ) {
             return best.first
         }
-        if (seconds >= 1.8f && (best == null || best.second < 0.47f) && profiles.size < 24) {
+        if (seconds >= 2.0f && (best == null || best.second < 0.42f) && profiles.size < 48) {
             val name = "$label ${nextSpeaker++}"
-            profiles.add(Profile(name, vector, 1))
+            profiles.add(Profile(id = null, name = name, vector = vector, observations = 1, accumulatedCleanSeconds = seconds))
             return name
         }
         return clusterLabel
     }
 
     private fun similarity(profile: Profile, vector: FloatArray): Float =
-        maxOf(cosine(profile.vector, vector), profile.samples.maxOf { cosine(it, vector) } - 0.035f)
+        VoiceprintMath.similarity(profile.vector, profile.samples, vector)
 
-    private fun updateProfile(index: Int, vector: FloatArray) {
+    private fun updateProfile(
+        index: Int,
+        vector: FloatArray,
+        cleanSeconds: Float = 0f,
+        fallbackClip: ByteArray? = null
+    ) {
         val prior = profiles[index]
-        val weight = prior.observations.coerceAtMost(8)
-        val mean = FloatArray(vector.size) { prior.vector[it] * weight + vector[it] }
-        val samples = if (prior.samples.none { cosine(it, vector) >= 0.9f }) {
-            prior.samples.take(1) + prior.samples.drop(1).takeLast(2) + listOf(vector)
-        } else prior.samples
-        profiles[index] = prior.copy(vector = normalized(mean) ?: prior.vector, observations = weight + 1, samples = samples)
+        val maxWeight = if (prior.persistent) 12 else 8
+        val merged = VoiceprintMath.mergeEmbedding(
+            existingCentroid = prior.vector,
+            existingPrototypes = prior.samples,
+            existingSamples = prior.observations,
+            newEmbedding = vector,
+            maxWeight = maxWeight
+        ) ?: return
+        profiles[index] = prior.copy(
+            vector = merged.first,
+            samples = merged.second,
+            observations = merged.third,
+            dirty = prior.persistent,
+            accumulatedCleanSeconds = prior.accumulatedCleanSeconds + cleanSeconds,
+            dirtyAddedSeconds = if (prior.persistent) prior.dirtyAddedSeconds + cleanSeconds else prior.dirtyAddedSeconds,
+            previewPcm16 = prior.previewPcm16 ?: fallbackClip
+        )
     }
 
     private fun overlap(start: Float, end: Float, otherStart: Float, otherEnd: Float): Float =
@@ -227,11 +418,15 @@ internal class SpeakerDiarizer(assets: AssetManager, private val label: String) 
 
     private fun embed(samples: FloatArray): FloatArray? {
         if (samples.size < SAMPLE_RATE * 0.75f) return null
+        var sumSq = 0.0
+        for (s in samples) sumSq += s.toDouble() * s.toDouble()
+        val rms = kotlin.math.sqrt(sumSq / samples.size)
+        if (rms < 0.0045) return null
         val stream = extractor.createStream()
         return try {
             stream.acceptWaveform(samples, SAMPLE_RATE)
             stream.inputFinished()
-            if (extractor.isReady(stream)) normalized(extractor.compute(stream)) else null
+            if (extractor.isReady(stream)) VoiceprintMath.normalize(extractor.compute(stream)) else null
         } finally {
             stream.release()
         }
@@ -242,24 +437,12 @@ internal class SpeakerDiarizer(assets: AssetManager, private val label: String) 
         return FloatArray(shorts.remaining()) { shorts.get() / 32768f }
     }
 
-    private fun normalized(vector: FloatArray): FloatArray? {
-        val norm = sqrt(cosine(vector, vector))
-        if (!norm.isFinite() || norm <= 0f) return null
-        return FloatArray(vector.size) { vector[it] / norm }
-    }
-
-    private fun cosine(left: FloatArray, right: FloatArray): Float {
-        var score = 0f
-        for (i in left.indices) score += left[i] * right[i]
-        return score
-    }
-
     override fun close() {
         extractor.release()
         diarization.release()
     }
 
     companion object {
-        private const val SAMPLE_RATE = 16_000
+        private const val SAMPLE_RATE = VoiceprintMath.SAMPLE_RATE
     }
 }

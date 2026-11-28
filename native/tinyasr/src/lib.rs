@@ -180,9 +180,13 @@ impl Models {
         if let [l] = langs {
             return (self.asr.full(x, *l, beam, serial_dec), Some(*l));
         }
+        let Some((embedded, frames)) = self.asr.embed_audio(x) else {
+            return (Vec::new(), None);
+        };
         let mut best: Option<(f32, Vec<crate::model::Token>, usize)> = None;
         for &l in langs {
-            let t = self.asr.full(x, l, beam, serial_dec);
+            let (enc, te) = self.asr.encode_embedded(embedded.clone(), frames, l);
+            let t = self.asr.search(&enc, te, l, beam, serial_dec);
             let sc = if t.is_empty() { -1e9 } else { t.iter().map(|k| k.logp).sum::<f32>() / t.len() as f32 };
             if best.as_ref().is_none_or(|b| sc > b.0) {
                 best = Some((sc, t, l));

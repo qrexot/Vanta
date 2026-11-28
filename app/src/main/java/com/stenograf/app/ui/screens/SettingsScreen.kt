@@ -9,7 +9,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -17,15 +16,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -53,7 +49,6 @@ import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -71,12 +66,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -85,7 +77,9 @@ import com.stenograf.app.asr.GroqAsrClient
 import com.stenograf.app.asr.ModelInstallStatus
 import com.stenograf.app.asr.TinyAsrCatalog
 import com.stenograf.app.data.model.AudioFormat
+import com.stenograf.app.data.model.SpeakerProfileEntity
 import com.stenograf.app.data.prefs.AppSettings
+import com.stenograf.app.data.prefs.RecognitionAudioFilter
 import com.stenograf.app.data.prefs.AsrEngineMode
 import com.stenograf.app.data.prefs.ThemeMode
 import com.stenograf.app.data.repo.StorageBreakdown
@@ -96,14 +90,9 @@ import com.stenograf.app.i18n.LocalStrings
 import com.stenograf.app.ui.components.GlassScaffold
 import com.stenograf.app.ui.components.SectionHeader
 import com.stenograf.app.ui.components.SegmentedStorageBar
-import com.stenograf.app.ui.components.SheetOptionRow
 import com.stenograf.app.ui.components.StorageSegment
-import com.stenograf.app.ui.components.VantaBottomSheet
 import com.stenograf.app.ui.components.VantaDangerButton
-import com.stenograf.app.ui.components.VantaDialog
 import com.stenograf.app.ui.components.VantaInfoCallout
-import com.stenograf.app.ui.components.VantaSearchField
-import com.stenograf.app.ui.components.VantaSwitch
 import com.stenograf.app.ui.components.VantaTonalButton
 import com.stenograf.app.ui.components.VantaTopBar
 import com.stenograf.app.ui.components.formatStorageSize
@@ -114,7 +103,6 @@ import com.stenograf.app.ui.theme.Spacing
 import com.stenograf.app.ui.theme.VantaType
 import com.stenograf.app.ui.theme.pressScale
 import com.stenograf.app.ui.theme.rememberVantaHaptics
-import com.stenograf.app.ui.theme.vantaSurfaceCard
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -141,6 +129,17 @@ fun SettingsScreen(
     onSelectGroqModel: (String) -> Unit,
     onSelectGroqLanguageMode: (String) -> Unit = {},
     onToggleSpeakers: (Boolean) -> Unit,
+    onSelectRecognitionAudioFilter: (RecognitionAudioFilter) -> Unit = {},
+    onToggleAutoLearnSpeakers: (Boolean) -> Unit = {},
+    speakerProfiles: List<SpeakerProfileEntity> = emptyList(),
+    isRecordingActive: Boolean = false,
+    onEnrollPcmVoiceProfile: suspend (String, String, ByteArray, Long?) -> Boolean = { _, _, _, _ -> false },
+    onUpdateVoiceProfileDetails: (Long, String, String, Boolean) -> Unit = { _, _, _, _ -> },
+    onMergeVoiceProfiles: (Long, Long) -> Unit = { _, _ -> },
+    onEnsureVoiceSampleClip: suspend (Long) -> SpeakerProfileEntity? = { null },
+    onOpenSourceRecording: (Long) -> Unit = {},
+    onDeleteVoiceProfile: (Long) -> Unit = {},
+    onShowMessage: (String) -> Unit = {},
     onOpenModelManager: () -> Unit,
     onClearCache: () -> Unit,
     onResetAllData: () -> Unit
@@ -153,19 +152,9 @@ fun SettingsScreen(
     val haptics = rememberVantaHaptics()
     val listState = rememberLazyListState()
 
-    var showUiLangSheet by remember { mutableStateOf(false) }
+    var activeModal by remember { mutableStateOf<SettingsModal?>(null) }
+    var showAudioFilter by remember { mutableStateOf(false) }
     var uiLangQuery by remember { mutableStateOf("") }
-    var showPresetSheet by remember { mutableStateOf(false) }
-    var showAudioFmtSheet by remember { mutableStateOf(false) }
-    var showBeamSheet by remember { mutableStateOf(false) }
-    var showThreadsSheet by remember { mutableStateOf(false) }
-    var showThemeSheet by remember { mutableStateOf(false) }
-
-    var showResetStep1 by remember { mutableStateOf(false) }
-    var showResetStep2 by remember { mutableStateOf(false) }
-    var showEngineSheet by remember { mutableStateOf(false) }
-    var showGroqModelSheet by remember { mutableStateOf(false) }
-    var showGroqLangSheet by remember { mutableStateOf(false) }
     var groqKeyDraft by remember { mutableStateOf(settings.groqApiKey) }
     LaunchedEffect(settings.groqApiKey) {
         if (settings.groqApiKey != groqKeyDraft.trim()) {
@@ -182,7 +171,6 @@ fun SettingsScreen(
     val selectedUiLang = AppLanguage.fromCode(settings.uiLanguageCode)
     val resolvedSystemLang = remember(settings.uiLanguageCode) { AppLocaleManager.resolveLanguage("system") }
     val currentPreset = TinyAsrCatalog.findPreset(settings.languagePresetId)
-    val installedModelsCount = modelStatuses.count { it.isInstalled }
 
     GlassScaffold(
         topBar = {
@@ -221,7 +209,7 @@ fun SettingsScreen(
                         onClick = {
                             haptics.tick()
                             uiLangQuery = ""
-                            showUiLangSheet = true
+                            activeModal = SettingsModal.UI_LANG
                         }
                     )
                     SettingsDivider()
@@ -232,7 +220,7 @@ fun SettingsScreen(
                         value = settings.themeMode.label(s),
                         onClick = {
                             haptics.tick()
-                            showThemeSheet = true
+                            activeModal = SettingsModal.THEME
                         }
                     )
                     SettingsDivider()
@@ -290,19 +278,6 @@ fun SettingsScreen(
                             )
                         }
                         Spacer(Modifier.width(Spacing.sm))
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text(
-                                text = "$installedModelsCount/${modelStatuses.size}",
-                                color = colors.accent,
-                                style = VantaType.monoMetric
-                            )
-                            Text(
-                                text = formatStorageSize(storage.modelsBytes),
-                                color = colors.textMuted,
-                                style = VantaType.monoBadge
-                            )
-                        }
-                        Spacer(Modifier.width(Spacing.xs))
                         Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, contentDescription = null, tint = colors.textMuted)
                     }
                 }
@@ -319,12 +294,12 @@ fun SettingsScreen(
                         value = if (settings.asrEngineMode == AsrEngineMode.GROQ_API) {
                             "Groq API (${settings.groqModelId})"
                         } else {
-                            "TinyASR (Локально · Офлайн)"
+                            "Локально (TinyASR / GigaAM · Офлайн)"
                         },
                         subtitle = "Выберите, через что идёт распознавание в реальном времени и импорте",
                         onClick = {
                             haptics.tick()
-                            showEngineSheet = true
+                            activeModal = SettingsModal.ENGINE
                         }
                     )
                     SettingsDivider()
@@ -531,7 +506,7 @@ fun SettingsScreen(
                             ?: settings.groqModelId,
                         onClick = {
                             haptics.tick()
-                            showGroqModelSheet = true
+                            activeModal = SettingsModal.GROQ_MODEL
                         }
                     )
                     SettingsDivider()
@@ -542,7 +517,7 @@ fun SettingsScreen(
                         value = GroqAsrClient.languageLabel(settings.groqLanguageMode),
                         onClick = {
                             haptics.tick()
-                            showGroqLangSheet = true
+                            activeModal = SettingsModal.GROQ_LANG
                         }
                     )
 
@@ -567,6 +542,30 @@ fun SettingsScreen(
                             }
                         )
                         SettingsDivider()
+                        SettingSwitchRow(
+                            title = extra.autoLearnSpeakersTitle,
+                            subtitle = extra.autoLearnSpeakersSubtitle,
+                            icon = Icons.Rounded.AutoAwesome,
+                            iconBg = Color(0xFF14B8A6),
+                            checked = settings.autoLearnSpeakers,
+                            onCheckedChange = {
+                                haptics.tick()
+                                onToggleAutoLearnSpeakers(it)
+                            }
+                        )
+                        SettingsDivider()
+                        SettingValueRow(
+                            title = extra.speakerProfilesTitle,
+                            subtitle = extra.speakerProfilesSubtitle,
+                            icon = Icons.Rounded.RecordVoiceOver,
+                            iconBg = Color(0xFF059669),
+                            value = speakerProfiles.size.toString(),
+                            onClick = {
+                                haptics.tick()
+                                activeModal = SettingsModal.SPEAKER_PROFILES
+                            }
+                        )
+                        SettingsDivider()
                         SettingValueRow(
                             title = s.defaultAsrPresetTitle,
                             icon = Icons.Rounded.Language,
@@ -574,7 +573,7 @@ fun SettingsScreen(
                             value = currentPreset.label(s),
                             onClick = {
                                 haptics.tick()
-                                showPresetSheet = true
+                                activeModal = SettingsModal.PRESET
                             }
                         )
                         SettingsDivider()
@@ -585,7 +584,7 @@ fun SettingsScreen(
                             value = if (settings.asrBeam == 1) s.fastGreedy1 else s.accuracyBeam4,
                             onClick = {
                                 haptics.tick()
-                                showBeamSheet = true
+                                activeModal = SettingsModal.BEAM
                             }
                         )
                         SettingsDivider()
@@ -596,7 +595,7 @@ fun SettingsScreen(
                             value = if (settings.asrThreads == 0) s.threadsAuto else "${settings.asrThreads} ${s.threadsCount}",
                             onClick = {
                                 haptics.tick()
-                                showThreadsSheet = true
+                                activeModal = SettingsModal.THREADS
                             }
                         )
                         SettingsDivider()
@@ -638,7 +637,7 @@ fun SettingsScreen(
                         value = settings.audioFormat.label(s),
                         onClick = {
                             haptics.tick()
-                            showAudioFmtSheet = true
+                            activeModal = SettingsModal.AUDIO_FORMAT
                         }
                     )
                     SettingsDivider()
@@ -654,9 +653,19 @@ fun SettingsScreen(
                         }
                     )
                     SettingsDivider()
+                    val russian = (if (selectedUiLang == AppLanguage.SYSTEM) resolvedSystemLang else selectedUiLang).code == "ru"
+                    SettingValueRow(
+                        title = if (russian) "Шумоподавление для текста" else "Noise filter for transcription",
+                        value = settings.recognitionAudioFilter.title(russian),
+                        subtitle = if (russian) "Встроено · для новой записи и распознавания исходного аудио." else "Built in · for new recordings and transcription from original audio.",
+                        icon = Icons.Rounded.AutoAwesome,
+                        iconBg = Color(0xFF0EA5E9),
+                        onClick = { showAudioFilter = true }
+                    )
+                    SettingsDivider()
                     SettingSwitchRow(
-                        title = extra.distantSpeechBoostTitle,
-                        subtitle = extra.distantSpeechBoostSubtitle,
+                        title = if (russian) "Усилить тихий голос для текста" else extra.distantSpeechBoostTitle,
+                        subtitle = if (russian) "Оставьте включённым для лекций, если преподаватель далеко." else extra.distantSpeechBoostSubtitle,
                         icon = Icons.Rounded.Tune,
                         iconBg = Color(0xFFFB8C00),
                         checked = settings.distantSpeechBoost,
@@ -750,7 +759,7 @@ fun SettingsScreen(
                                 outlined = true,
                                 onClick = {
                                     haptics.heavy()
-                                    showResetStep1 = true
+                                    activeModal = SettingsModal.RESET_STEP1
                                 },
                                 modifier = Modifier.fillMaxWidth()
                             )
@@ -850,492 +859,46 @@ fun SettingsScreen(
             }
         }
 
-        // Searchable UI Language picker sheet (all 40 languages)
-        if (showUiLangSheet) {
-            val filteredLangs = remember(uiLangQuery) {
-                val q = uiLangQuery.trim().lowercase()
-                if (q.isEmpty()) AppLanguage.selectableLanguages
-                else AppLanguage.selectableLanguages.filter {
-                    it.nativeName.lowercase().contains(q) || it.code.lowercase().contains(q)
-                }
-            }
-            VantaBottomSheet(
-                onDismissRequest = { showUiLangSheet = false },
-                title = s.uiLanguageTitle,
-                headerIcon = Icons.Rounded.Language
-            ) {
-                VantaSearchField(
-                    value = uiLangQuery,
-                    onValueChange = { uiLangQuery = it },
-                    placeholder = s.searchHint
-                )
-                Spacer(Modifier.height(Spacing.sm))
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(380.dp)
-                ) {
-                    if (uiLangQuery.isBlank()) {
-                        item(key = "lang_system") {
-                            SheetOptionRow(
-                                selected = selectedUiLang == AppLanguage.SYSTEM,
-                                title = s.uiLanguageSystem,
-                                subtitle = resolvedSystemLang.nativeName,
-                                onClick = {
-                                    haptics.tick()
-                                    onSelectUiLanguage(AppLanguage.SYSTEM.code)
-                                    showUiLangSheet = false
-                                }
-                            )
-                        }
-                    }
-                    items(filteredLangs, key = { it.code }) { lang ->
-                        val subtitle = if (lang.isRtl) "${lang.code} · RTL" else lang.code
-                        SheetOptionRow(
-                            selected = selectedUiLang == lang,
-                            title = lang.nativeName,
-                            subtitle = subtitle,
-                            onClick = {
-                                haptics.tick()
-                                onSelectUiLanguage(lang.code)
-                                showUiLangSheet = false
-                            }
-                        )
-                    }
-                }
-            }
-        }
-
-        if (showPresetSheet) {
-            val installedPresets = remember(modelStatuses) {
-                TinyAsrCatalog.PRESETS.filter { p ->
-                    modelStatuses.any { it.spec.id == p.modelId && it.isInstalled } ||
-                        TinyAsrCatalog.findModel(p.modelId).bundledInApk
-                }
-            }
-            VantaBottomSheet(
-                onDismissRequest = { showPresetSheet = false },
-                title = s.defaultAsrPresetTitle,
-                headerIcon = Icons.Rounded.Translate
-            ) {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 420.dp)
-                ) {
-                    items(installedPresets, key = { it.id }) { preset ->
-                        SheetOptionRow(
-                            selected = preset.id == settings.languagePresetId,
-                            title = preset.label(s),
-                            subtitle = preset.modelId,
-                            onClick = {
-                                haptics.tick()
-                                onSelectLanguagePreset(preset.id)
-                                showPresetSheet = false
-                            }
-                        )
-                    }
-                    item {
-                        Spacer(Modifier.height(Spacing.md))
-                        VantaTonalButton(
-                            label = s.manageModelsTitle,
-                            onClick = {
-                                showPresetSheet = false
-                                onOpenModelManager()
-                            },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                }
-            }
-        }
-
-        if (showAudioFmtSheet) {
-            VantaBottomSheet(
-                onDismissRequest = { showAudioFmtSheet = false },
-                title = s.audioQualityTitle,
-                headerIcon = Icons.Rounded.GraphicEq
-            ) {
-                for (fmt in AudioFormat.entries) {
-                    SheetOptionRow(
-                        selected = settings.audioFormat == fmt,
-                        title = fmt.label(s),
-                        onClick = {
-                            haptics.tick()
-                            onSelectAudioFormat(fmt)
-                            showAudioFmtSheet = false
-                        }
-                    )
-                }
-            }
-        }
-
-        if (showBeamSheet) {
-            VantaBottomSheet(
-                onDismissRequest = { showBeamSheet = false },
-                title = s.decodingAccuracyTitle,
-                headerIcon = Icons.Rounded.Tune
-            ) {
-                SheetOptionRow(
-                    selected = settings.asrBeam == 4,
-                    title = s.decodingAccuracyBeam,
-                    onClick = {
-                        haptics.tick()
-                        onSelectBeam(4)
-                        showBeamSheet = false
-                    }
-                )
-                SheetOptionRow(
-                    selected = settings.asrBeam == 1,
-                    title = s.decodingAccuracyGreedy,
-                    onClick = {
-                        haptics.tick()
-                        onSelectBeam(1)
-                        showBeamSheet = false
-                    }
-                )
-            }
-        }
-
-        if (showThreadsSheet) {
-            VantaBottomSheet(
-                onDismissRequest = { showThreadsSheet = false },
-                title = s.asrThreadsTitle,
-                headerIcon = Icons.Rounded.Memory
-            ) {
-                val opts = listOf(
-                    0 to s.threadsAutoLong,
-                    1 to s.threadsSingleLowHeat,
-                    2 to "2 ${s.threadsCount}",
-                    4 to "4 ${s.threadsCount}"
-                )
-                for ((n, label) in opts) {
-                    SheetOptionRow(
-                        selected = settings.asrThreads == n,
-                        title = label,
-                        onClick = {
-                            haptics.tick()
-                            onSelectThreads(n)
-                            showThreadsSheet = false
-                        }
-                    )
-                }
-            }
-        }
-
-        if (showEngineSheet) {
-            VantaBottomSheet(
-                onDismissRequest = { showEngineSheet = false },
-                title = "Движок распознавания",
-                headerIcon = Icons.Rounded.AutoAwesome
-            ) {
-                SheetOptionRow(
-                    selected = settings.asrEngineMode == AsrEngineMode.LOCAL_TINYASR,
-                    title = "TinyASR (Локально · Офлайн)",
-                    subtitle = "Работает полностью без интернета и без лимитов",
-                    onClick = {
-                        haptics.tick()
-                        onSelectAsrEngine(AsrEngineMode.LOCAL_TINYASR)
-                        showEngineSheet = false
-                    }
-                )
-                SheetOptionRow(
-                    selected = settings.asrEngineMode == AsrEngineMode.GROQ_API,
-                    title = "Groq API (Свой ключ · Спикеры)",
-                    subtitle = "Whisper распознаёт речь блоками во время записи. Спикеры определяются на устройстве.",
-                    onClick = {
-                        haptics.tick()
-                        onSelectAsrEngine(AsrEngineMode.GROQ_API)
-                        showEngineSheet = false
-                    }
-                )
-            }
-        }
-
-        if (showGroqModelSheet) {
-            VantaBottomSheet(
-                onDismissRequest = { showGroqModelSheet = false },
-                title = "Модель Groq",
-                headerIcon = Icons.Rounded.AutoAwesome
-            ) {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 360.dp)
-                ) {
-                    items(availableGroqModels, key = { it.first }) { (id, label) ->
-                        SheetOptionRow(
-                            selected = settings.groqModelId == id,
-                            title = label,
-                            subtitle = id,
-                            onClick = {
-                                haptics.tick()
-                                onSelectGroqModel(id)
-                                showGroqModelSheet = false
-                            }
-                        )
-                    }
-                }
-            }
-        }
-
-        if (showGroqLangSheet) {
-            VantaBottomSheet(
-                onDismissRequest = { showGroqLangSheet = false },
-                title = "Язык распознавания (Groq)",
-                subtitle = "«Русский + English (Авто)» позволяет Whisper свободно переключаться между русским и английским в одной записи.",
-                headerIcon = Icons.Rounded.Translate
-            ) {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 360.dp)
-                ) {
-                    items(GroqAsrClient.SUPPORTED_LANGUAGE_MODES, key = { it.first }) { (code, label) ->
-                        SheetOptionRow(
-                            selected = settings.groqLanguageMode == code,
-                            title = label,
-                            subtitle = when (code) {
-                                "multi" -> "Смешанная речь RU + EN без принудительной транслитерации"
-                                "auto" -> "Автоопределение среди ~99 языков"
-                                else -> "Принудительно: $code"
-                            },
-                            onClick = {
-                                haptics.tick()
-                                onSelectGroqLanguageMode(code)
-                                showGroqLangSheet = false
-                            }
-                        )
-                    }
-                }
-            }
-        }
-
-        if (showThemeSheet) {
-            VantaBottomSheet(
-                onDismissRequest = { showThemeSheet = false },
-                title = s.themeTitle,
-                headerIcon = Icons.Rounded.Palette
-            ) {
-                for (mode in ThemeMode.entries) {
-                    SheetOptionRow(
-                        selected = settings.themeMode == mode,
-                        title = mode.label(s),
-                        onClick = {
-                            haptics.tick()
-                            onSelectTheme(mode)
-                            showThemeSheet = false
-                        }
-                    )
-                }
-            }
-        }
-
-        // Strict double-confirmation for Reset All App Data
-        if (showResetStep1) {
-            VantaDialog(
-                onDismissRequest = { showResetStep1 = false },
-                title = s.resetAllDataTitle,
-                icon = Icons.Rounded.DeleteForever,
-                iconTint = colors.destructive,
-                iconContainerColor = colors.destructiveSoft,
-                message = s.resetAllDataMessage,
-                confirmLabel = s.resetAllDataConfirm,
-                isDestructive = true,
-                onConfirm = {
-                    showResetStep1 = false
-                    showResetStep2 = true
-                },
-                dismissLabel = s.cancel,
-                onDismiss = { showResetStep1 = false }
+        if (showAudioFilter) {
+            val russian = (if (selectedUiLang == AppLanguage.SYSTEM) resolvedSystemLang else selectedUiLang).code == "ru"
+            RecognitionFilterSheet(
+                current = settings.recognitionAudioFilter,
+                russian = russian,
+                onChoose = { filter -> haptics.tick(); onSelectRecognitionAudioFilter(filter); showAudioFilter = false },
+                onDismiss = { showAudioFilter = false }
             )
         }
 
-        if (showResetStep2) {
-            VantaDialog(
-                onDismissRequest = { showResetStep2 = false },
-                title = s.resetAllDataConfirm,
-                icon = Icons.Rounded.DeleteForever,
-                iconTint = colors.destructive,
-                iconContainerColor = colors.destructiveSoft,
-                message = s.resetAllDataMessage,
-                confirmLabel = s.delete,
-                isDestructive = true,
-                onConfirm = {
-                    haptics.heavy()
-                    showResetStep2 = false
-                    onResetAllData()
-                },
-                dismissLabel = s.cancel,
-                onDismiss = { showResetStep2 = false }
-            )
-        }
-    }
-}
-
-@Composable
-private fun SettingsDivider() {
-    val colors = LocalStenografColors.current
-    HorizontalDivider(
-        color = colors.border,
-        thickness = 0.5.dp,
-        modifier = Modifier.padding(start = 66.dp)
-    )
-}
-
-@Composable
-private fun SettingsCard(content: @Composable ColumnScope.() -> Unit) {
-    val colors = LocalStenografColors.current
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .vantaSurfaceCard(colors, radius = Radius.lg, elevated = false),
-        content = content
-    )
-}
-
-@Composable
-private fun SettingLeadingIcon(
-    icon: ImageVector,
-    badgeColor: Color = LocalStenografColors.current.accent
-) {
-    Box(
-        modifier = Modifier
-            .size(34.dp)
-            .clip(RoundedCornerShape(10.dp))
-            .background(badgeColor),
-        contentAlignment = Alignment.Center
-    ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = Color.White,
-            modifier = Modifier.size(18.dp)
-        )
-    }
-}
-
-@Composable
-private fun SettingValueRow(
-    title: String,
-    value: String,
-    icon: ImageVector,
-    iconBg: Color = LocalStenografColors.current.accent,
-    subtitle: String? = null,
-    onClick: () -> Unit
-) {
-    val colors = LocalStenografColors.current
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(horizontal = Spacing.lg, vertical = 14.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        SettingLeadingIcon(icon = icon, badgeColor = iconBg)
-        Spacer(Modifier.width(Spacing.md))
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = title,
-                color = colors.textPrimary,
-                style = VantaType.rowLabel,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
-            )
-            if (!subtitle.isNullOrBlank()) {
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    text = subtitle,
-                    color = colors.textSecondary,
-                    style = VantaType.bodySmall,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-            Spacer(Modifier.height(3.dp))
-            Text(
-                text = value,
-                color = colors.accent,
-                style = VantaType.bodySmall.copy(fontWeight = FontWeight.Medium),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
-        Spacer(Modifier.width(Spacing.sm))
-        Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, contentDescription = null, tint = colors.textMuted)
-    }
-}
-
-@Composable
-private fun SettingSwitchRow(
-    title: String,
-    subtitle: String,
-    icon: ImageVector,
-    iconBg: Color = LocalStenografColors.current.accent,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    val colors = LocalStenografColors.current
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .toggleable(value = checked, role = Role.Switch, onValueChange = onCheckedChange)
-            .padding(horizontal = Spacing.lg, vertical = 13.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        SettingLeadingIcon(icon = icon, badgeColor = iconBg)
-        Spacer(Modifier.width(Spacing.md))
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .padding(end = Spacing.md)
-        ) {
-            Text(
-                text = title,
-                color = colors.textPrimary,
-                style = VantaType.rowLabel
-            )
-            Spacer(Modifier.height(2.dp))
-            Text(
-                text = subtitle,
-                color = colors.textSecondary,
-                style = VantaType.bodySmall
-            )
-        }
-        VantaSwitch(checked = checked)
-    }
-}
-
-@Composable
-private fun StorageLegendRow(label: String, bytes: Long, dotColor: Color?) {
-    val colors = LocalStenografColors.current
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-            if (dotColor != null) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(dotColor)
-                )
-                Spacer(Modifier.width(Spacing.sm))
-            }
-            Text(
-                text = label,
-                color = if (dotColor != null) colors.textPrimary else colors.textSecondary,
-                style = VantaType.body,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
-        Text(
-            text = formatStorageSize(bytes),
-            color = colors.textSecondary,
-            style = VantaType.monoMetric
+        SettingsModalHost(
+            activeModal = activeModal,
+            onSetModal = { activeModal = it },
+            uiLangQuery = uiLangQuery,
+            onUiLangQueryChange = { uiLangQuery = it },
+            selectedUiLang = selectedUiLang,
+            resolvedSystemLang = resolvedSystemLang,
+            settings = settings,
+            modelStatuses = modelStatuses,
+            availableGroqModels = availableGroqModels,
+            speakerProfiles = speakerProfiles,
+            isRecordingActive = isRecordingActive,
+            onSelectUiLanguage = onSelectUiLanguage,
+            onSelectLanguagePreset = onSelectLanguagePreset,
+            onSelectAudioFormat = onSelectAudioFormat,
+            onSelectBeam = onSelectBeam,
+            onSelectThreads = onSelectThreads,
+            onSelectAsrEngine = onSelectAsrEngine,
+            onSelectGroqModel = onSelectGroqModel,
+            onSelectGroqLanguageMode = onSelectGroqLanguageMode,
+            onSelectTheme = onSelectTheme,
+            onEnrollPcmVoiceProfile = onEnrollPcmVoiceProfile,
+            onUpdateVoiceProfileDetails = onUpdateVoiceProfileDetails,
+            onMergeVoiceProfiles = onMergeVoiceProfiles,
+            onEnsureVoiceSampleClip = onEnsureVoiceSampleClip,
+            onOpenSourceRecording = onOpenSourceRecording,
+            onDeleteVoiceProfile = onDeleteVoiceProfile,
+            onShowMessage = onShowMessage,
+            onOpenModelManager = onOpenModelManager,
+            onResetAllData = onResetAllData
         )
     }
 }
