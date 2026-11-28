@@ -1,33 +1,37 @@
-# Vanta for Android
+# Vanta для Android
 
-**English** · [Русский](README.ru.md)
+Vanta превращает лекции, интервью и голосовые заметки в текст. Приложение распознаёт речь во время записи, сохраняет исходное аудио и позволяет заново обработать всю запись или отдельный фрагмент.
 
-Vanta records audio and turns speech into text as you record. Use it in lectures and seminars to revisit anything you missed, or to review interviews, meetings, and voice notes. The original audio stays available for playback and a second transcription pass.
+**Android 8.0 и новее**
 
-## Features
+[Скачать APK 1.3.11](https://github.com/qrexot/Vanta/releases/download/v1.3.11/Vanta-1.3.11.apk) · [Архив исходников ZIP](https://github.com/qrexot/Vanta/releases/download/v1.3.11/VantaAndroid-1.3.11-src.zip) · [Все релизы](https://github.com/qrexot/Vanta/releases)
 
-- On-device transcription with TinyASR and a built-in Russian, English, and Ukrainian model.
-- Downloadable language packs and local `.tzf` model import.
-- Bookmarks, timestamps, automatic paragraphs, and optional speaker labels.
-- Re-transcription on device or through Groq’s Whisper Large V3 Turbo. The optional Groq mode requires an API key and sends audio to Groq.
-- Transcript export to TXT, SRT, PDF, or DOCX, plus separate audio sharing.
+## Что умеет Vanta
 
-## Screenshots
+- **Распознавать речь офлайн.** Русский, английский и украинский доступны во встроенной модели. Немецкий и французский тоже можно выбрать сразу. Дополнительные языки и движки загружаются из раздела «Модели».
+- **Записывать и импортировать.** Запустите диктофон или откройте аудио и видео с аудиодорожкой. Готовую расшифровку можно редактировать, искать по ней и дополнять закладками.
+- **Очищать аудио.** В плеере откройте «Фильтры», выберите задачу и сравните один фрагмент до и после обработки. Приложение создаёт отдельную WAV-копию и сохраняет исходник.
+- **Расшифровывать повторно.** Используйте локальную модель или подключите Groq со своим API-ключом. При выборе Groq аудио отправляется на обработку в облако.
+- **Экспортировать результат.** Текст сохраняется в TXT, SRT, PDF и DOCX. Аудиофайлом можно поделиться отдельно.
 
-| Live transcription | Language models | Re-transcription |
-| :---: | :---: | :---: |
-| <a href="docs/screenshots/live-recording.jpg"><img src="docs/screenshots/live-recording.jpg" width="225" alt="Live transcription while recording"></a> | <a href="docs/screenshots/language-models.jpg"><img src="docs/screenshots/language-models.jpg" width="225" alt="Language model catalog"></a> | <a href="docs/screenshots/retranscription.jpg"><img src="docs/screenshots/retranscription.jpg" width="225" alt="Local and cloud re-transcription options"></a> |
+## Как начать
 
-| Recording actions | Recording settings |
-| :---: | :---: |
-| <a href="docs/screenshots/recording-actions.jpg"><img src="docs/screenshots/recording-actions.jpg" width="225" alt="Recording actions"></a> | <a href="docs/screenshots/settings.jpg"><img src="docs/screenshots/settings.jpg" width="225" alt="Recording settings"></a> |
+1. Установите APK и откройте раздел «Модели», чтобы выбрать язык речи.
+2. Нажмите кнопку микрофона для новой записи или импортируйте готовый файл.
+3. Откройте запись, чтобы прочитать текст с временными метками, прослушать нужный момент или сохранить результат.
 
-## Building
+Для лекций на русском подойдёт встроенная модель. Для тихой речи можно включить усиление в настройках распознавания. Если мешает фоновый шум, попробуйте «Быструю очистку» прямо из плеера.
 
-Vanta targets Android 8.0 and later. The Gradle project uses JDK 17, Android SDK 35, NDK 27.2.12479018, and CMake 3.22.1. A complete local checkout requires the native archives and model assets bundled in the original source package.
+## Сборка из исходников
 
-With the complete project open in Android Studio, sync Gradle and run the `app` module. To build from a terminal, run `./gradlew assembleDebug` (`gradlew.bat assembleDebug` on Windows). The output is under `app/build/outputs/apk/debug/`.
+Откройте полный архив исходников в Android Studio. Для сборки нужны JDK 17, Android SDK 35, NDK 27.2.12479018 и CMake 3.22.1.
 
-## License
+```powershell
+.\gradlew.bat assembleDebug
+```
 
-The original Vanta code is released under the [MIT License](LICENSE). You may use, modify, and redistribute it, including commercially, with the license notice retained. It is provided **as is**, without warranty. Third-party components retain their own terms, including [TinyASR under GPL-3.0-or-later](native/tinyasr/LICENSE) and the [notices for bundled models](app/src/main/assets/models).
+На Linux и macOS используйте `./gradlew assembleDebug`. Готовый APK появится в `app/build/outputs/apk/debug/`.
+
+## Лицензия
+
+Код Vanta распространяется по [лицензии MIT](LICENSE). У сторонних компонентов собственные условия, включая [GPL-3.0-or-later для TinyASR](native/tinyasr/LICENSE) и [лицензии встроенных моделей](app/src/main/assets/models).
